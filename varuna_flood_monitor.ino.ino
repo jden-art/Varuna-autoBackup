@@ -69,6 +69,18 @@
 #define BASELINE_SIZE 48
 #define BASELINE_INTERVAL 1800000UL
 
+#define ZONE_NORMAL  0
+#define ZONE_ALERT   1
+#define ZONE_WARNING 2
+#define ZONE_DANGER  3
+
+#define RATE_SLOW     0
+#define RATE_MODERATE 1
+#define RATE_FAST     2
+
+#define RATE_CLAMP_MAX 200.0
+#define RATE_MIN_ELAPSED_SEC 60.0
+
 #define FIREBASE_HOST   "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH   ""
 #define FIREBASE_PATH   "/varuna/live"
@@ -157,6 +169,20 @@ int   baselineCount = 0;
 unsigned long lastBaselineUpdate = 0;
 
 const char* modeNames[] = {"SLACK", "TAUT", "FLOOD", "SUBMERGED"};
+
+float alertLevelCm = 120.0;
+float warningLevelCm = 180.0;
+float dangerLevelCm = 250.0;
+int   currentZone = ZONE_NORMAL;
+
+const char* zoneNames[] = {"NORMAL", "ALERT", "WARNING", "DANGER"};
+
+float previousHeight = -1.0;
+unsigned long previousHeightTime = 0;
+float ratePer15Min = 0.0;
+int   currentRateCategory = RATE_SLOW;
+
+const char* rateNames[] = {"SLOW", "MODERATE", "FAST"};
 
 
 void mpuWriteReg(uint8_t r, uint8_t v) {
@@ -360,7 +386,7 @@ bool bmpReadData(float *temperature, float *pressure) {
 void initPressureBaseline() {
   Serial.println("\n── PRESSURE BASELINE INIT ──");
   if (!bmpAvailable) {
-    Serial.println("  ✗ BMP280 not available — no baseline");
+    Serial.println("  ✗ BMP280 not available");
     return;
   }
   float sum = 0;
@@ -395,11 +421,9 @@ void updatePressureBaseline() {
   if (currentMode == MODE_SUBMERGED) return;
   if (millis() - lastBaselineUpdate < BASELINE_INTERVAL) return;
   if (currentPressure < 300.0 || currentPressure > 1200.0) return;
-
   baselineBuffer[baselineIndex] = currentPressure;
   baselineIndex = (baselineIndex + 1) % BASELINE_SIZE;
   if (baselineCount < BASELINE_SIZE) baselineCount++;
-
   float sum = 0;
   for (int i = 0; i < baselineCount; i++) {
     sum += baselineBuffer[i];
@@ -414,7 +438,6 @@ void detectMode() {
   } else {
     pressureDeviation = 0.0;
   }
-
   if (pressureDeviation > SUBMERSION_PRESSURE_THRESH_HPA) {
     currentMode = MODE_SUBMERGED;
     estimatedDepth = pressureDeviation / 0.0981;
@@ -445,6 +468,40 @@ void detectMode() {
     tetherTaut = false;
     estimatedDepth = 0.0;
   }
+}
+
+int classifyZone(float heightCm) {
+  if (heightCm >= dangerLevelCm) return ZONE_DANGER;
+  if (heightCm >= warningLevelCm) return ZONE_WARNING;
+  if (heightCm >= alertLevelCm) return ZONE_ALERT;
+  return ZONE_NORMAL;
+}
+
+void calculateRateOfChange(float currentHeight, unsigned long currentTime) {
+  if (previousHeight < 0) {
+    previousHeight = currentHeight;
+    previousHeightTime = currentTime;
+    ratePer15Min = 0.0;
+    return;
+  }
+  float elapsed = (currentTime - previousHeightTime) / 1000.0;
+  if (elapsed < RATE_MIN_ELAPSED_SEC) {
+    return;
+  }
+  float change = currentHeight - previousHeight;
+  ratePer15Min = change * (900.0 / elapsed);
+  if (ratePer15Min > RATE_CLAMP_MAX || ratePer15Min < -RATE_CLAMP_MAX) {
+    ratePer15Min = 0.0;
+  }
+  previousHeight = currentHeight;
+  previousHeightTime = currentTime;
+}
+
+int classifyRate(float rate) {
+  if (rate < 0.0) return RATE_SLOW;
+  if (rate < 2.0) return RATE_SLOW;
+  if (rate < 5.0) return RATE_MODERATE;
+  return RATE_FAST;
 }
 
 uint8_t bcdToDec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
@@ -934,7 +991,6 @@ bool initWiFi() {
 
 bool wifiPostToFirebase(const char *payload, int payloadLen) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("  ✗ WiFi not connected");
     wifiConnected = false;
     return false;
   }
@@ -943,7 +999,6 @@ bool wifiPostToFirebase(const char *payload, int payloadLen) {
     snprintf(url, sizeof(url), "https://%s%s.json?auth=%s", FIREBASE_HOST, FIREBASE_PATH, FIREBASE_AUTH);
   else
     snprintf(url, sizeof(url), "https://%s%s.json", FIREBASE_HOST, FIREBASE_PATH);
-  Serial.printf("  WiFi POST to: %s\n", url);
   HTTPClient http;
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
@@ -951,12 +1006,9 @@ bool wifiPostToFirebase(const char *payload, int payloadLen) {
   int httpCode = http.PUT((uint8_t *)payload, payloadLen);
   String response = http.getString();
   http.end();
-  Serial.printf("  HTTP %d", httpCode);
   if (httpCode == 200) {
-    Serial.println(" ✓");
     return true;
   }
-  Serial.printf(" ✗\n  Response: %s\n", response.c_str());
   return false;
 }
 
@@ -969,6 +1021,8 @@ int buildSensorPayload(char *buf, int bufSize) {
     "\"waterHeight\":%.1f,\"olpLength\":%.1f,\"horizontalDist\":%.1f,"
     "\"lateralAccel\":%.4f,\"lateralAccel_ms2\":%.3f,\"tetherTaut\":%s,"
     "\"mode\":%d,\"modeName\":\"%s\","
+    "\"zone\":%d,\"zoneName\":\"%s\","
+    "\"ratePer15Min\":%.2f,\"rateCategory\":%d,\"rateName\":\"%s\","
     "\"pressureDeviation\":%.2f,\"estimatedDepth\":%.1f,"
     "\"baselinePressure\":%.2f,"
     "\"pressure\":%.2f,\"temperature\":%.1f,"
@@ -981,6 +1035,8 @@ int buildSensorPayload(char *buf, int bufSize) {
     waterHeight, olpLength, horizontalDist,
     lateralAccel, lateralAccel_ms2, tetherTaut ? "true" : "false",
     currentMode, modeNames[currentMode],
+    currentZone, zoneNames[currentZone],
+    ratePer15Min, currentRateCategory, rateNames[currentRateCategory],
     pressureDeviation, estimatedDepth,
     baselinePressure,
     currentPressure, currentTemperature,
@@ -992,10 +1048,8 @@ int buildSensorPayload(char *buf, int bufSize) {
 }
 
 bool postToFirebase() {
-  char payload[512];
+  char payload[600];
   int len = buildSensorPayload(payload, sizeof(payload));
-  Serial.printf("\n  ── POST via %s ──\n", activeTransport == TRANSPORT_GPRS ? "GPRS" : "WiFi");
-  Serial.printf("  Payload (%d bytes): %s\n", len, payload);
   bool success = false;
   if (activeTransport == TRANSPORT_GPRS) {
     success = gprsPostToFirebase(payload, len);
@@ -1005,25 +1059,17 @@ bool postToFirebase() {
   if (success) {
     postSuccessCount++;
     transportFailCount = 0;
-    Serial.println("  ✓ POST SUCCESS");
   } else {
     postFailCount++;
     transportFailCount++;
-    Serial.printf("  ✗ POST FAILED (consecutive: %d)\n", transportFailCount);
     if (transportFailCount >= TRANSPORT_FAIL_THRESHOLD) {
       transportFailCount = 0;
       if (activeTransport == TRANSPORT_GPRS) {
-        if (initWiFi()) {
-          activeTransport = TRANSPORT_WIFI;
-        } else {
-          gprsInit();
-        }
+        if (initWiFi()) { activeTransport = TRANSPORT_WIFI; }
+        else { gprsInit(); }
       } else if (activeTransport == TRANSPORT_WIFI) {
-        if (simAvailable && gprsInit()) {
-          activeTransport = TRANSPORT_GPRS;
-        } else {
-          initWiFi();
-        }
+        if (simAvailable && gprsInit()) { activeTransport = TRANSPORT_GPRS; }
+        else { initWiFi(); }
       }
     }
   }
@@ -1039,11 +1085,10 @@ void initTransport() {
   if (simOk && simRegistered) {
     if (gprsInit() && gprsConnected) {
       activeTransport = TRANSPORT_GPRS;
-      Serial.println("\n  ✓ PRIMARY TRANSPORT: GPRS (cellular)\n");
+      Serial.println("\n  ✓ PRIMARY TRANSPORT: GPRS\n");
       return;
     }
   }
-  Serial.println("\n  SIM800L/GPRS not available — trying WiFi...");
   if (initWiFi()) {
     activeTransport = TRANSPORT_WIFI;
     Serial.println("\n  ✓ FALLBACK TRANSPORT: WiFi\n");
@@ -1112,7 +1157,6 @@ void initBattery() {
   updateBattery();
   Serial.printf("  Voltage: %.0f mV  Percent: %.1f%%  State: %s\n",
                 batteryVoltage_mV, batteryPercent, batteryState.c_str());
-  if (batteryVoltage_mV < 500.0) Serial.println("  ⚠ Battery may not be connected");
   Serial.println("  ✓ BATTERY ADC READY");
 }
 
@@ -1122,7 +1166,7 @@ void setup() {
 
   Serial.println();
   Serial.println("┌──────────────────────────────────────────────────┐");
-  Serial.println("│   VARUNA — Step 2.3: Mode Detection Engine      │");
+  Serial.println("│   VARUNA — Step 3.1+3.2: Zone + Rate            │");
   Serial.println("└──────────────────────────────────────────────────┘");
 
   I2C_0.begin(SDA_0, SCL_0, 100000);
@@ -1141,20 +1185,16 @@ void setup() {
   initTransport();
 
   if (activeTransport != TRANSPORT_NONE) {
-    Serial.println("\n── INITIAL FIREBASE TEST POST ──");
     postToFirebase();
   }
 
   prevTime = millis();
 
   Serial.println("\n══════════════════════════════════════════════════");
-  Serial.println("  LIVE OUTPUT — 2 Hz");
-  Serial.printf("  OLP Length: %.1f cm\n", olpLength);
-  Serial.printf("  Submersion threshold: %.1f hPa\n", SUBMERSION_PRESSURE_THRESH_HPA);
-  Serial.printf("  Flood angle threshold: %.1f°\n", FLOOD_ANGLE_THRESH_DEG);
-  Serial.printf("  Flood height ratio: %.2f\n", FLOOD_HEIGHT_RATIO);
-  Serial.printf("  Baseline pressure: %.2f hPa\n", baselinePressure);
-  Serial.println("  Modes: 0=SLACK  1=TAUT  2=FLOOD  3=SUBMERGED");
+  Serial.printf("  OLP: %.1f cm\n", olpLength);
+  Serial.printf("  Zones: ALERT=%.0f  WARNING=%.0f  DANGER=%.0f cm\n",
+                alertLevelCm, warningLevelCm, dangerLevelCm);
+  Serial.printf("  Rates: SLOW<2  MODERATE<5  FAST≥5 cm/15min\n");
   Serial.println("══════════════════════════════════════════════════\n");
 }
 
@@ -1192,6 +1232,10 @@ void loop() {
 
   detectMode();
 
+  currentZone = classifyZone(waterHeight);
+  calculateRateOfChange(waterHeight, millis());
+  currentRateCategory = classifyRate(ratePer15Min);
+
   if (millis() - lastRtcRead >= 1000) {
     lastRtcRead = millis();
     readRTC(rtcYear, rtcMonth, rtcDay, rtcHour, rtcMin, rtcSec);
@@ -1227,34 +1271,30 @@ void loop() {
     char timeStr[32];
     formatDateTime(currentUnixTime, timeStr, sizeof(timeStr));
 
-    Serial.printf("MODE:%d(%s) θ%6.2f° H=%6.1fcm | ",
-                  currentMode, modeNames[currentMode], theta, waterHeight);
+    Serial.printf("M%d(%s) Z%d(%s) R:%s %+.1f | ",
+                  currentMode, modeNames[currentMode],
+                  currentZone, zoneNames[currentZone],
+                  rateNames[currentRateCategory], ratePer15Min);
 
-    Serial.printf("la=%.3fg %.2fm/s² | ", lateralAccel, lateralAccel_ms2);
+    Serial.printf("θ%6.2f° H=%6.1fcm | ", theta, waterHeight);
 
     if (bmpAvailable && currentPressure > 0)
-      Serial.printf("P:%.1f base:%.1f dev:%+.2fhPa | ", currentPressure, baselinePressure, pressureDeviation);
+      Serial.printf("P:%+.2fhPa | ", pressureDeviation);
 
     if (currentMode == MODE_SUBMERGED)
       Serial.printf("depth:%.1fcm | ", estimatedDepth);
 
     Serial.printf("%s | ", timeStr);
 
-    if (gpsFixValid)
-      Serial.printf("GPS:%.4f,%.4f | ", gpsLat, gpsLon);
-    else
-      Serial.print("GPS:-- | ");
-
     if (activeTransport == TRANSPORT_GPRS)
-      Serial.printf("GPRS r:%d | ", simSignalRSSI);
+      Serial.printf("GPRS | ");
     else if (activeTransport == TRANSPORT_WIFI)
-      Serial.printf("WiFi %ddBm | ", WiFi.RSSI());
+      Serial.printf("WiFi | ");
     else
-      Serial.print("NO_NET | ");
+      Serial.print("-- | ");
 
-    Serial.printf("BAT:%.0fmV %.0f%% | ", batteryVoltage_mV, batteryPercent);
-
-    Serial.printf("FB:ok%d fail%d", postSuccessCount, postFailCount);
+    Serial.printf("BAT:%.0f%% | ", batteryPercent);
+    Serial.printf("FB:%d/%d", postSuccessCount, postFailCount);
     Serial.println();
   }
 
@@ -1264,24 +1304,23 @@ void loop() {
     Serial.printf("  GPS: fix:%s sats:%d hdop:%.1f synced:%s\n",
                   gpsFixValid ? "Y" : "N", gpsSatellites, gpsHdop, gpsTimeSynced ? "Y" : "N");
 
-    Serial.println("  ┌── BATTERY ─────────────────────────────────────┐");
-    Serial.printf( "  │  Voltage: %.0f mV  Percent: %.1f%%  State: %s\n",
+    Serial.println("  ┌── FLOOD STATUS ────────────────────────────────┐");
+    Serial.printf( "  │  Mode:       %d (%s)\n", currentMode, modeNames[currentMode]);
+    Serial.printf( "  │  Zone:       %d (%s)\n", currentZone, zoneNames[currentZone]);
+    Serial.printf( "  │  Rate:       %+.2f cm/15min (%s)\n", ratePer15Min, rateNames[currentRateCategory]);
+    Serial.printf( "  │  Height:     %.1f cm\n", waterHeight);
+    Serial.printf( "  │  OLP:        %.1f cm\n", olpLength);
+    Serial.printf( "  │  H/L:        %.3f\n", olpLength > 0 ? waterHeight / olpLength : 0);
+    Serial.printf( "  │  Theta:      %.2f°\n", theta);
+    Serial.printf( "  │  Tether:     %s\n", tetherTaut ? "TAUT" : "SLACK");
+    Serial.printf( "  │  Lat Accel:  %.4fg (%.3f m/s²)\n", lateralAccel, lateralAccel_ms2);
+    Serial.printf( "  │  P dev:      %+.2f hPa\n", pressureDeviation);
+    Serial.printf( "  │  Depth:      %.1f cm\n", estimatedDepth);
+    Serial.printf( "  │  Baseline:   %.2f hPa\n", baselinePressure);
+    Serial.printf( "  │  Thresholds: A=%.0f W=%.0f D=%.0f cm\n",
+                   alertLevelCm, warningLevelCm, dangerLevelCm);
+    Serial.printf( "  │  Battery:    %.0fmV %.1f%% %s\n",
                    batteryVoltage_mV, batteryPercent, batteryState.c_str());
-    Serial.println("  └────────────────────────────────────────────────┘");
-
-    Serial.println("  ┌── MODE DETECTION ──────────────────────────────┐");
-    Serial.printf( "  │  Current mode:      %d (%s)\n", currentMode, modeNames[currentMode]);
-    Serial.printf( "  │  OLP Length:         %.1f cm\n", olpLength);
-    Serial.printf( "  │  Theta:              %.2f°\n", theta);
-    Serial.printf( "  │  Water Height:       %.1f cm\n", waterHeight);
-    Serial.printf( "  │  Horizontal Dist:    %.1f cm\n", horizontalDist);
-    Serial.printf( "  │  Lateral Accel:      %.4f g  (%.3f m/s²)\n", lateralAccel, lateralAccel_ms2);
-    Serial.printf( "  │  Tether:             %s\n", tetherTaut ? "TAUT" : "SLACK");
-    Serial.printf( "  │  Pressure:           %.2f hPa\n", currentPressure);
-    Serial.printf( "  │  Baseline:           %.2f hPa\n", baselinePressure);
-    Serial.printf( "  │  Deviation:          %+.2f hPa\n", pressureDeviation);
-    Serial.printf( "  │  Est. Depth:         %.1f cm\n", estimatedDepth);
-    Serial.printf( "  │  H/L ratio:          %.3f\n", olpLength > 0 ? waterHeight / olpLength : 0);
     Serial.println("  └────────────────────────────────────────────────┘");
   }
 
