@@ -1,281 +1,227 @@
-/*
- * ═══════════════════════════════════════════════════════════════════════════
- * VARUNA FLOOD MONITOR - ESP32-S3 Based Flood Detection System
- * ═══════════════════════════════════════════════════════════════════════════
- * Phase 1.1: I2C Bus Setup and Scanner
- * 
- * Hardware Connections:
- *   I2C Bus 0 (MPU6050):
- *     - SDA: GPIO 8
- *     - SCL: GPIO 9
- *   
- *   I2C Bus 1 (DS1307 RTC + BMP280):
- *     - SDA: GPIO 4
- *     - SCL: GPIO 5
- * ═══════════════════════════════════════════════════════════════════════════
- */
-
 #include <Wire.h>
-#include <HardwareSerial.h>
-#include <EEPROM.h>
-#include <SPIFFS.h>
-#include <esp_task_wdt.h>
-#include <esp_sleep.h>
 
-// ═══════════════════════════════════════════════════════════════════════════
-// PIN DEFINITIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-// I2C Bus 0 - MPU6050 (Accelerometer/Gyroscope)
+// ─── PIN DEFINITIONS ───
 #define SDA_0  8
 #define SCL_0  9
-
-// I2C Bus 1 - RTC (DS1307) + Barometer (BMP280)
 #define SDA_1  4
 #define SCL_1  5
 
-// GPS Module (Serial)
-#define GPS_RX 6
-#define GPS_TX 7
+// ─── MPU6050 CONSTANTS ───
+#define MPU6050_ADDR        0x68
+#define REG_PWR_MGMT_1      0x6B
+#define REG_SMPLRT_DIV       0x19
+#define REG_CONFIG           0x1A
+#define REG_GYRO_CONFIG      0x1B
+#define REG_ACCEL_CONFIG     0x1C
+#define REG_WHO_AM_I         0x75
+#define REG_ACCEL_XOUT_H     0x3B
 
-// SIM800L GSM Module (Serial)
-#define SIM_RX  15
-#define SIM_TX  16
-#define SIM_RST 17
+// Sensitivity scale factors (from datasheet)
+// ±2g  → 16384 LSB/g
+// ±250°/s → 131 LSB/(°/s)
+#define ACCEL_SCALE  16384.0
+#define GYRO_SCALE   131.0
 
-// Analog & Digital I/O
-#define BATTERY_PIN  2   // ADC for battery voltage monitoring
-#define STATUS_LED   3   // System status indicator
-#define ALGO_BUTTON  12  // Algorithm selection button
-#define ALGO_LED     13  // Algorithm status LED
-#define C3_FEED_PIN  14  // Watchdog feed to external ESP32-C3
+// ─── I2C BUSES ───
+TwoWire I2C_0 = TwoWire(0);
+TwoWire I2C_1 = TwoWire(1);
 
-// ═══════════════════════════════════════════════════════════════════════════
-// CONSTANTS
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── MPU6050 LIVE DATA ───
+float ax, ay, az;       // accelerometer in g
+float gx, gy, gz;       // gyroscope in °/s
+float mpuTemp;           // die temperature °C
+bool  mpuHealthy = false;
 
-#define ALPHA           0.98    // Complementary filter coefficient
-#define WDT_TIMEOUT_SEC 120     // Watchdog timeout in seconds
-#define I2C_CLOCK_SPEED 100000  // 100kHz I2C clock
+// ──────────────────────────────────────────────
+//  LOW-LEVEL I2C HELPERS
+// ──────────────────────────────────────────────
 
-// Known I2C Addresses
-#define MPU6050_ADDR    0x68    // MPU6050 (can also be 0x69 if AD0 is HIGH)
-#define DS1307_ADDR     0x68    // DS1307 RTC
-#define BMP280_ADDR     0x76    // BMP280 (can also be 0x77)
+void mpuWriteReg(uint8_t reg, uint8_t value) {
+  I2C_0.beginTransmission(MPU6050_ADDR);
+  I2C_0.write(reg);
+  I2C_0.write(value);
+  I2C_0.endTransmission();
+}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// GLOBAL OBJECTS
-// ═══════════════════════════════════════════════════════════════════════════
+uint8_t mpuReadReg(uint8_t reg) {
+  I2C_0.beginTransmission(MPU6050_ADDR);
+  I2C_0.write(reg);
+  I2C_0.endTransmission(false);          // repeated start
+  I2C_0.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)1);
+  if (I2C_0.available()) {
+    return I2C_0.read();
+  }
+  return 0xFF;                            // read failed
+}
 
-// Two independent I2C buses
-TwoWire I2C_0 = TwoWire(0);  // Bus 0: MPU6050
-TwoWire I2C_1 = TwoWire(1);  // Bus 1: RTC + BMP280
+// ──────────────────────────────────────────────
+//  INIT
+// ──────────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════════════
-// FUNCTION DECLARATIONS
-// ═══════════════════════════════════════════════════════════════════════════
+bool initMPU6050() {
+  Serial.println("  Writing PWR_MGMT_1 = 0x00  (wake up)");
+  mpuWriteReg(REG_PWR_MGMT_1, 0x00);
+  delay(100);                             // datasheet: wait after wake
 
-void initI2CBuses();
-void scanBus(TwoWire &bus, const char* name);
-void scanAllBuses();
-void printDeviceName(uint8_t addr, uint8_t busNum);
-void blinkLED(int times, int delayMs);
+  Serial.println("  Writing SMPLRT_DIV = 0x07  (125 Hz sample rate)");
+  mpuWriteReg(REG_SMPLRT_DIV, 0x07);     // 1 kHz / (1+7) = 125 Hz
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SETUP
-// ═══════════════════════════════════════════════════════════════════════════
+  Serial.println("  Writing CONFIG     = 0x03  (DLPF 44 Hz)");
+  mpuWriteReg(REG_CONFIG, 0x03);
+
+  Serial.println("  Writing GYRO_CFG   = 0x00  (±250 °/s)");
+  mpuWriteReg(REG_GYRO_CONFIG, 0x00);
+
+  Serial.println("  Writing ACCEL_CFG  = 0x00  (±2 g)");
+  mpuWriteReg(REG_ACCEL_CONFIG, 0x00);
+
+  // ── verify identity ──
+  uint8_t whoami = mpuReadReg(REG_WHO_AM_I);
+  Serial.printf("  WHO_AM_I register  = 0x%02X  ", whoami);
+
+  if (whoami == 0x68 || whoami == 0x72) {
+    Serial.println("✓ valid");
+    mpuHealthy = true;
+    return true;
+  }
+
+  Serial.println("✗ UNEXPECTED — check wiring");
+  mpuHealthy = false;
+  return false;
+}
+
+// ──────────────────────────────────────────────
+//  READ 14 BYTES — ACCEL + TEMP + GYRO
+// ──────────────────────────────────────────────
+
+bool readMPU6050() {
+  I2C_0.beginTransmission(MPU6050_ADDR);
+  I2C_0.write(REG_ACCEL_XOUT_H);
+  if (I2C_0.endTransmission(false) != 0) {
+    Serial.println("  ✗ I2C transmit error");
+    return false;
+  }
+
+  uint8_t bytesReceived = I2C_0.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14);
+  if (bytesReceived < 14) {
+    Serial.printf("  ✗ Expected 14 bytes, got %d\n", bytesReceived);
+    return false;
+  }
+
+  // read into buffer first — avoids undefined evaluation order
+  uint8_t buf[14];
+  for (int i = 0; i < 14; i++) {
+    buf[i] = I2C_0.read();
+  }
+
+  // registers are big-endian 16-bit signed
+  int16_t rawAx   = ((int16_t)buf[0]  << 8) | buf[1];
+  int16_t rawAy   = ((int16_t)buf[2]  << 8) | buf[3];
+  int16_t rawAz   = ((int16_t)buf[4]  << 8) | buf[5];
+  int16_t rawTemp = ((int16_t)buf[6]  << 8) | buf[7];
+  int16_t rawGx   = ((int16_t)buf[8]  << 8) | buf[9];
+  int16_t rawGy   = ((int16_t)buf[10] << 8) | buf[11];
+  int16_t rawGz   = ((int16_t)buf[12] << 8) | buf[13];
+
+  // convert to physical units
+  ax = rawAx / ACCEL_SCALE;              // g
+  ay = rawAy / ACCEL_SCALE;
+  az = rawAz / ACCEL_SCALE;
+
+  gx = rawGx / GYRO_SCALE;              // °/s
+  gy = rawGy / GYRO_SCALE;
+  gz = rawGz / GYRO_SCALE;
+
+  mpuTemp = rawTemp / 340.0 + 36.53;    // °C  (datasheet formula)
+
+  return true;
+}
+
+// ──────────────────────────────────────────────
+//  READ-BACK VERIFICATION
+//  confirm registers hold what we wrote
+// ──────────────────────────────────────────────
+
+void verifyRegisters() {
+  Serial.println("\n  Register verification:");
+
+  uint8_t v;
+  v = mpuReadReg(REG_PWR_MGMT_1);
+  Serial.printf("    PWR_MGMT_1  = 0x%02X  %s\n", v, (v == 0x00) ? "✓" : "✗");
+
+  v = mpuReadReg(REG_SMPLRT_DIV);
+  Serial.printf("    SMPLRT_DIV  = 0x%02X  %s\n", v, (v == 0x07) ? "✓" : "✗");
+
+  v = mpuReadReg(REG_CONFIG);
+  Serial.printf("    CONFIG      = 0x%02X  %s\n", v, (v == 0x03) ? "✓" : "✗");
+
+  v = mpuReadReg(REG_GYRO_CONFIG);
+  Serial.printf("    GYRO_CFG    = 0x%02X  %s\n", v, (v == 0x00) ? "✓" : "✗");
+
+  v = mpuReadReg(REG_ACCEL_CONFIG);
+  Serial.printf("    ACCEL_CFG   = 0x%02X  %s\n", v, (v == 0x00) ? "✓" : "✗");
+}
+
+// ──────────────────────────────────────────────
+//  SETUP
+// ──────────────────────────────────────────────
 
 void setup() {
-  // Initialize serial communication
   Serial.begin(115200);
-  
-  // Wait for serial port to connect (needed for native USB)
-  delay(2000);
-  
-  // Print boot header
+  delay(1000);
+
   Serial.println();
-  Serial.println("═══════════════════════════════════════════════════════════");
-  Serial.println("           VARUNA FLOOD MONITOR - SYSTEM BOOT              ");
-  Serial.println("═══════════════════════════════════════════════════════════");
-  Serial.println();
-  
-  // Initialize status LED
-  pinMode(STATUS_LED, OUTPUT);
-  digitalWrite(STATUS_LED, LOW);
-  
-  // Visual boot indicator
-  blinkLED(3, 100);
-  
-  // Initialize I2C buses
-  initI2CBuses();
-  
-  // Scan all I2C buses for connected devices
-  scanAllBuses();
-  
-  // Boot complete indicator
-  Serial.println();
-  Serial.println("═══════════════════════════════════════════════════════════");
-  Serial.println("                    BOOT COMPLETE                          ");
-  Serial.println("═══════════════════════════════════════════════════════════");
-  Serial.println();
-  
-  // Solid LED indicates successful boot
-  digitalWrite(STATUS_LED, HIGH);
+  Serial.println("┌─────────────────────────────────────────┐");
+  Serial.println("│     VARUNA — Step 1.2: MPU6050 Driver   │");
+  Serial.println("└─────────────────────────────────────────┘");
+
+  I2C_0.begin(SDA_0, SCL_0, 100000);
+  I2C_1.begin(SDA_1, SCL_1, 100000);
+  Serial.println("\nI2C buses initialised");
+
+  Serial.println("\n── MPU6050 INIT ──");
+  if (initMPU6050()) {
+    verifyRegisters();
+    Serial.println("\n── MPU6050 READY ──\n");
+  } else {
+    Serial.println("\n── MPU6050 FAILED — halting ──\n");
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// MAIN LOOP
-// ═══════════════════════════════════════════════════════════════════════════
+// ──────────────────────────────────────────────
+//  LOOP — continuous read at 5 Hz
+// ──────────────────────────────────────────────
+
+unsigned long lastPrint = 0;
+unsigned long readCount = 0;
 
 void loop() {
-  // For now, just re-scan buses every 10 seconds for testing
-  static unsigned long lastScan = 0;
-  
-  if (millis() - lastScan > 10000) {
-    lastScan = millis();
-    Serial.println("\n[PERIODIC SCAN]");
-    scanAllBuses();
+  if (!mpuHealthy) {
+    delay(1000);
+    return;
   }
-  
-  // Heartbeat blink
-  static unsigned long lastBlink = 0;
-  if (millis() - lastBlink > 1000) {
-    lastBlink = millis();
-    digitalWrite(STATUS_LED, !digitalRead(STATUS_LED));
+
+  if (!readMPU6050()) {
+    delay(500);
+    return;
   }
-  
-  delay(100);
-}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// I2C INITIALIZATION
-// ═══════════════════════════════════════════════════════════════════════════
+  readCount++;
 
-void initI2CBuses() {
-  Serial.println("[I2C] Initializing I2C buses...");
-  
-  // Initialize Bus 0 (MPU6050)
-  Serial.printf("[I2C] Bus 0: SDA=%d, SCL=%d, Speed=%dHz\n", 
-                SDA_0, SCL_0, I2C_CLOCK_SPEED);
-  
-  if (I2C_0.begin(SDA_0, SCL_0, I2C_CLOCK_SPEED)) {
-    Serial.println("[I2C] Bus 0: Initialized successfully");
-  } else {
-    Serial.println("[I2C] Bus 0: INITIALIZATION FAILED!");
+  // print at 5 Hz (every 200 ms) for readability
+  if (millis() - lastPrint >= 200) {
+    lastPrint = millis();
+
+    float totalG = sqrt(ax * ax + ay * ay + az * az);
+
+    Serial.println("────────────────────────────────────────────────");
+    Serial.printf("  Accel (g)  :  X %+7.3f   Y %+7.3f   Z %+7.3f   |G| %.3f\n",
+                  ax, ay, az, totalG);
+    Serial.printf("  Gyro (°/s) :  X %+7.2f   Y %+7.2f   Z %+7.2f\n",
+                  gx, gy, gz);
+    Serial.printf("  Temp (°C)  :  %.1f\n", mpuTemp);
+    Serial.printf("  Reads      :  %lu\n", readCount);
   }
-  
-  // Initialize Bus 1 (RTC + BMP280)
-  Serial.printf("[I2C] Bus 1: SDA=%d, SCL=%d, Speed=%dHz\n", 
-                SDA_1, SCL_1, I2C_CLOCK_SPEED);
-  
-  if (I2C_1.begin(SDA_1, SCL_1, I2C_CLOCK_SPEED)) {
-    Serial.println("[I2C] Bus 1: Initialized successfully");
-  } else {
-    Serial.println("[I2C] Bus 1: INITIALIZATION FAILED!");
-  }
-  
-  Serial.println("[I2C] Bus initialization complete");
-  Serial.println();
-}
 
-// ═══════════════════════════════════════════════════════════════════════════
-// I2C BUS SCANNER
-// ═══════════════════════════════════════════════════════════════════════════
-
-void scanBus(TwoWire &bus, const char* name) {
-  Serial.printf("Scanning %s...\n", name);
-  
-  int deviceCount = 0;
-  
-  for (uint8_t addr = 1; addr < 127; addr++) {
-    bus.beginTransmission(addr);
-    uint8_t error = bus.endTransmission();
-    
-    if (error == 0) {
-      Serial.printf("  ✓ Found device at 0x%02X", addr);
-      
-      // Print known device name
-      if (strcmp(name, "Bus 0") == 0) {
-        printDeviceName(addr, 0);
-      } else {
-        printDeviceName(addr, 1);
-      }
-      
-      Serial.println();
-      deviceCount++;
-    } else if (error == 4) {
-      Serial.printf("  ✗ Unknown error at 0x%02X\n", addr);
-    }
-  }
-  
-  if (deviceCount == 0) {
-    Serial.println("  No devices found!");
-  } else {
-    Serial.printf("  Total: %d device(s) found\n", deviceCount);
-  }
-}
-
-void scanAllBuses() {
-  Serial.println("┌─────────────────────────────────────────┐");
-  Serial.println("│           I2C BUS SCAN RESULTS          │");
-  Serial.println("└─────────────────────────────────────────┘");
-  
-  scanBus(I2C_0, "Bus 0");
-  Serial.println();
-  scanBus(I2C_1, "Bus 1");
-}
-
-void printDeviceName(uint8_t addr, uint8_t busNum) {
-  // Identify common devices based on address and bus number
-  switch (addr) {
-    case 0x68:
-      if (busNum == 0) {
-        Serial.print(" -> MPU6050 (Accel/Gyro)");
-      } else {
-        Serial.print(" -> DS1307 (RTC)");
-      }
-      break;
-    
-    case 0x69:
-      Serial.print(" -> MPU6050 (AD0=HIGH)");
-      break;
-    
-    case 0x76:
-      Serial.print(" -> BMP280 (Barometer)");
-      break;
-    
-    case 0x77:
-      Serial.print(" -> BMP280/BMP180 (Alt Addr)");
-      break;
-    
-    case 0x50:
-      Serial.print(" -> AT24C32 (EEPROM on RTC)");
-      break;
-    
-    case 0x57:
-      Serial.print(" -> AT24C32 (Alt EEPROM)");
-      break;
-    
-    case 0x3C:
-    case 0x3D:
-      Serial.print(" -> OLED Display");
-      break;
-    
-    default:
-      Serial.print(" -> Unknown Device");
-      break;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// UTILITY FUNCTIONS
-// ═══════════════════════════════════════════════════════════════════════════
-
-void blinkLED(int times, int delayMs) {
-  for (int i = 0; i < times; i++) {
-    digitalWrite(STATUS_LED, HIGH);
-    delay(delayMs);
-    digitalWrite(STATUS_LED, LOW);
-    delay(delayMs);
-  }
+  delay(8);   // ~125 Hz read rate matches SMPLRT_DIV setting
 }
