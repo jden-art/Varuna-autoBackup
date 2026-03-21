@@ -57,6 +57,18 @@
 #define TETHER_LATERAL_THRESH_MS2  0.15
 #define TETHER_ANGLE_THRESH_DEG    3.0
 
+#define MODE_SLACK     0
+#define MODE_TAUT      1
+#define MODE_FLOOD     2
+#define MODE_SUBMERGED 3
+
+#define SUBMERSION_PRESSURE_THRESH_HPA  5.0
+#define FLOOD_ANGLE_THRESH_DEG          10.0
+#define FLOOD_HEIGHT_RATIO              0.95
+
+#define BASELINE_SIZE 48
+#define BASELINE_INTERVAL 1800000UL
+
 #define FIREBASE_HOST   "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH   ""
 #define FIREBASE_PATH   "/varuna/live"
@@ -134,6 +146,17 @@ float horizontalDist = 0.0;
 float lateralAccel = 0.0;
 float lateralAccel_ms2 = 0.0;
 bool  tetherTaut = false;
+
+int   currentMode = MODE_SLACK;
+float pressureDeviation = 0.0;
+float estimatedDepth = 0.0;
+float baselinePressure = 0.0;
+float baselineBuffer[BASELINE_SIZE];
+int   baselineIndex = 0;
+int   baselineCount = 0;
+unsigned long lastBaselineUpdate = 0;
+
+const char* modeNames[] = {"SLACK", "TAUT", "FLOOD", "SUBMERGED"};
 
 
 void mpuWriteReg(uint8_t r, uint8_t v) {
@@ -332,6 +355,96 @@ bool bmpReadData(float *temperature, float *pressure) {
   *temperature = bmpCompensateTemp(adcT) / 100.0;
   *pressure = bmpCompensatePress(adcP) / 256.0 / 100.0;
   return true;
+}
+
+void initPressureBaseline() {
+  Serial.println("\n── PRESSURE BASELINE INIT ──");
+  if (!bmpAvailable) {
+    Serial.println("  ✗ BMP280 not available — no baseline");
+    return;
+  }
+  float sum = 0;
+  int good = 0;
+  for (int i = 0; i < 10; i++) {
+    float t, p;
+    if (bmpReadData(&t, &p)) {
+      if (p > 300.0 && p < 1200.0) {
+        sum += p;
+        good++;
+      }
+    }
+    delay(100);
+  }
+  if (good > 0) {
+    baselinePressure = sum / good;
+    for (int i = 0; i < BASELINE_SIZE; i++) {
+      baselineBuffer[i] = baselinePressure;
+    }
+    baselineCount = 1;
+    baselineIndex = 1;
+    lastBaselineUpdate = millis();
+    Serial.printf("  Baseline: %.2f hPa (%d samples)\n", baselinePressure, good);
+  } else {
+    Serial.println("  ✗ Could not establish baseline");
+  }
+  Serial.println("  ✓ BASELINE READY");
+}
+
+void updatePressureBaseline() {
+  if (!bmpAvailable) return;
+  if (currentMode == MODE_SUBMERGED) return;
+  if (millis() - lastBaselineUpdate < BASELINE_INTERVAL) return;
+  if (currentPressure < 300.0 || currentPressure > 1200.0) return;
+
+  baselineBuffer[baselineIndex] = currentPressure;
+  baselineIndex = (baselineIndex + 1) % BASELINE_SIZE;
+  if (baselineCount < BASELINE_SIZE) baselineCount++;
+
+  float sum = 0;
+  for (int i = 0; i < baselineCount; i++) {
+    sum += baselineBuffer[i];
+  }
+  baselinePressure = sum / baselineCount;
+  lastBaselineUpdate = millis();
+}
+
+void detectMode() {
+  if (bmpAvailable && currentPressure > 0 && baselinePressure > 0) {
+    pressureDeviation = currentPressure - baselinePressure;
+  } else {
+    pressureDeviation = 0.0;
+  }
+
+  if (pressureDeviation > SUBMERSION_PRESSURE_THRESH_HPA) {
+    currentMode = MODE_SUBMERGED;
+    estimatedDepth = pressureDeviation / 0.0981;
+    waterHeight = olpLength + estimatedDepth;
+    horizontalDist = 0.0;
+    tetherTaut = true;
+  }
+  else if (lateralAccel_ms2 > TETHER_LATERAL_THRESH_MS2 && theta > TETHER_ANGLE_THRESH_DEG) {
+    float tautHeight = olpLength * cos(theta * PI / 180.0);
+    if (theta < FLOOD_ANGLE_THRESH_DEG && tautHeight > FLOOD_HEIGHT_RATIO * olpLength) {
+      currentMode = MODE_FLOOD;
+      waterHeight = olpLength;
+      horizontalDist = olpLength * sin(theta * PI / 180.0);
+      tetherTaut = true;
+      estimatedDepth = 0.0;
+    } else {
+      currentMode = MODE_TAUT;
+      waterHeight = tautHeight;
+      horizontalDist = olpLength * sin(theta * PI / 180.0);
+      tetherTaut = true;
+      estimatedDepth = 0.0;
+    }
+  }
+  else {
+    currentMode = MODE_SLACK;
+    waterHeight = 0.0;
+    horizontalDist = 0.0;
+    tetherTaut = false;
+    estimatedDepth = 0.0;
+  }
 }
 
 uint8_t bcdToDec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
@@ -855,6 +968,9 @@ int buildSensorPayload(char *buf, int bufSize) {
     "\"tiltX\":%.2f,\"tiltY\":%.2f,"
     "\"waterHeight\":%.1f,\"olpLength\":%.1f,\"horizontalDist\":%.1f,"
     "\"lateralAccel\":%.4f,\"lateralAccel_ms2\":%.3f,\"tetherTaut\":%s,"
+    "\"mode\":%d,\"modeName\":\"%s\","
+    "\"pressureDeviation\":%.2f,\"estimatedDepth\":%.1f,"
+    "\"baselinePressure\":%.2f,"
     "\"pressure\":%.2f,\"temperature\":%.1f,"
     "\"gpsLat\":%.6f,\"gpsLon\":%.6f,"
     "\"gpsFix\":%s,\"satellites\":%d,"
@@ -864,6 +980,9 @@ int buildSensorPayload(char *buf, int bufSize) {
     STATION_ID, theta, correctedTiltX, correctedTiltY,
     waterHeight, olpLength, horizontalDist,
     lateralAccel, lateralAccel_ms2, tetherTaut ? "true" : "false",
+    currentMode, modeNames[currentMode],
+    pressureDeviation, estimatedDepth,
+    baselinePressure,
     currentPressure, currentTemperature,
     gpsLat, gpsLon,
     gpsFixValid ? "true" : "false", gpsSatellites,
@@ -873,7 +992,7 @@ int buildSensorPayload(char *buf, int bufSize) {
 }
 
 bool postToFirebase() {
-  char payload[450];
+  char payload[512];
   int len = buildSensorPayload(payload, sizeof(payload));
   Serial.printf("\n  ── POST via %s ──\n", activeTransport == TRANSPORT_GPRS ? "GPRS" : "WiFi");
   Serial.printf("  Payload (%d bytes): %s\n", len, payload);
@@ -892,17 +1011,14 @@ bool postToFirebase() {
     transportFailCount++;
     Serial.printf("  ✗ POST FAILED (consecutive: %d)\n", transportFailCount);
     if (transportFailCount >= TRANSPORT_FAIL_THRESHOLD) {
-      Serial.println("\n  ═══ TRANSPORT SWITCH ═══");
       transportFailCount = 0;
       if (activeTransport == TRANSPORT_GPRS) {
-        Serial.println("  GPRS failed 3x → switching to WiFi");
         if (initWiFi()) {
           activeTransport = TRANSPORT_WIFI;
         } else {
           gprsInit();
         }
       } else if (activeTransport == TRANSPORT_WIFI) {
-        Serial.println("  WiFi failed 3x → switching to GPRS");
         if (simAvailable && gprsInit()) {
           activeTransport = TRANSPORT_GPRS;
         } else {
@@ -1006,7 +1122,7 @@ void setup() {
 
   Serial.println();
   Serial.println("┌──────────────────────────────────────────────────┐");
-  Serial.println("│   VARUNA — Step 2.2: Lateral Accel + Tether     │");
+  Serial.println("│   VARUNA — Step 2.3: Mode Detection Engine      │");
   Serial.println("└──────────────────────────────────────────────────┘");
 
   I2C_0.begin(SDA_0, SCL_0, 100000);
@@ -1018,6 +1134,7 @@ void setup() {
   recalibrate();
 
   initBMP280();
+  initPressureBaseline();
   initRTC();
   initGPS();
   initBattery();
@@ -1033,8 +1150,11 @@ void setup() {
   Serial.println("\n══════════════════════════════════════════════════");
   Serial.println("  LIVE OUTPUT — 2 Hz");
   Serial.printf("  OLP Length: %.1f cm\n", olpLength);
-  Serial.printf("  Tether thresholds: lateral>%.2f m/s²  AND  θ>%.1f°\n",
-                TETHER_LATERAL_THRESH_MS2, TETHER_ANGLE_THRESH_DEG);
+  Serial.printf("  Submersion threshold: %.1f hPa\n", SUBMERSION_PRESSURE_THRESH_HPA);
+  Serial.printf("  Flood angle threshold: %.1f°\n", FLOOD_ANGLE_THRESH_DEG);
+  Serial.printf("  Flood height ratio: %.2f\n", FLOOD_HEIGHT_RATIO);
+  Serial.printf("  Baseline pressure: %.2f hPa\n", baselinePressure);
+  Serial.println("  Modes: 0=SLACK  1=TAUT  2=FLOOD  3=SUBMERGED");
   Serial.println("══════════════════════════════════════════════════\n");
 }
 
@@ -1061,17 +1181,16 @@ void loop() {
   if (!readMPU6050()) { delay(10); return; }
   updateComplementaryFilter();
 
-  waterHeight = olpLength * cos(theta * PI / 180.0);
-  horizontalDist = olpLength * sin(theta * PI / 180.0);
-
   lateralAccel = sqrt(ax * ax + ay * ay);
   lateralAccel_ms2 = lateralAccel * 9.81;
-  tetherTaut = (lateralAccel_ms2 > TETHER_LATERAL_THRESH_MS2) && (theta > TETHER_ANGLE_THRESH_DEG);
 
   if (bmpAvailable && (millis() - lastBmpRead >= 2000)) {
     lastBmpRead = millis();
     bmpReadData(&currentTemperature, &currentPressure);
+    updatePressureBaseline();
   }
+
+  detectMode();
 
   if (millis() - lastRtcRead >= 1000) {
     lastRtcRead = millis();
@@ -1108,13 +1227,16 @@ void loop() {
     char timeStr[32];
     formatDateTime(currentUnixTime, timeStr, sizeof(timeStr));
 
-    Serial.printf("θ%6.2f° H=%6.1fcm %s | ",
-                  theta, waterHeight, tetherTaut ? "TAUT" : "SLACK");
+    Serial.printf("MODE:%d(%s) θ%6.2f° H=%6.1fcm | ",
+                  currentMode, modeNames[currentMode], theta, waterHeight);
 
     Serial.printf("la=%.3fg %.2fm/s² | ", lateralAccel, lateralAccel_ms2);
 
     if (bmpAvailable && currentPressure > 0)
-      Serial.printf("%.1fhPa %.1f°C | ", currentPressure, currentTemperature);
+      Serial.printf("P:%.1f base:%.1f dev:%+.2fhPa | ", currentPressure, baselinePressure, pressureDeviation);
+
+    if (currentMode == MODE_SUBMERGED)
+      Serial.printf("depth:%.1fcm | ", estimatedDepth);
 
     Serial.printf("%s | ", timeStr);
 
@@ -1138,6 +1260,7 @@ void loop() {
 
   if (millis() - lastGpsPrint >= 30000) {
     lastGpsPrint = millis();
+
     Serial.printf("  GPS: fix:%s sats:%d hdop:%.1f synced:%s\n",
                   gpsFixValid ? "Y" : "N", gpsSatellites, gpsHdop, gpsTimeSynced ? "Y" : "N");
 
@@ -1146,17 +1269,19 @@ void loop() {
                    batteryVoltage_mV, batteryPercent, batteryState.c_str());
     Serial.println("  └────────────────────────────────────────────────┘");
 
-    Serial.println("  ┌── WATER HEIGHT ────────────────────────────────┐");
-    Serial.printf( "  │  OLP: %.1fcm  θ: %.2f°  H: %.1fcm  Horiz: %.1fcm\n",
-                   olpLength, theta, waterHeight, horizontalDist);
-    Serial.printf( "  │  H/L: %.3f\n", waterHeight / olpLength);
-    Serial.println("  └────────────────────────────────────────────────┘");
-
-    Serial.println("  ┌── TETHER STATUS ───────────────────────────────┐");
-    Serial.printf( "  │  Lateral accel: %.4f g  (%.3f m/s²)\n", lateralAccel, lateralAccel_ms2);
-    Serial.printf( "  │  Threshold:     %.3f m/s²  AND  θ > %.1f°\n",
-                   TETHER_LATERAL_THRESH_MS2, TETHER_ANGLE_THRESH_DEG);
-    Serial.printf( "  │  Tether state:  %s\n", tetherTaut ? "TAUT ──── (under tension)" : "SLACK ~~~~ (floating free)");
+    Serial.println("  ┌── MODE DETECTION ──────────────────────────────┐");
+    Serial.printf( "  │  Current mode:      %d (%s)\n", currentMode, modeNames[currentMode]);
+    Serial.printf( "  │  OLP Length:         %.1f cm\n", olpLength);
+    Serial.printf( "  │  Theta:              %.2f°\n", theta);
+    Serial.printf( "  │  Water Height:       %.1f cm\n", waterHeight);
+    Serial.printf( "  │  Horizontal Dist:    %.1f cm\n", horizontalDist);
+    Serial.printf( "  │  Lateral Accel:      %.4f g  (%.3f m/s²)\n", lateralAccel, lateralAccel_ms2);
+    Serial.printf( "  │  Tether:             %s\n", tetherTaut ? "TAUT" : "SLACK");
+    Serial.printf( "  │  Pressure:           %.2f hPa\n", currentPressure);
+    Serial.printf( "  │  Baseline:           %.2f hPa\n", baselinePressure);
+    Serial.printf( "  │  Deviation:          %+.2f hPa\n", pressureDeviation);
+    Serial.printf( "  │  Est. Depth:         %.1f cm\n", estimatedDepth);
+    Serial.printf( "  │  H/L ratio:          %.3f\n", olpLength > 0 ? waterHeight / olpLength : 0);
     Serial.println("  └────────────────────────────────────────────────┘");
   }
 
