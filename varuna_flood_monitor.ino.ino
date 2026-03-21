@@ -3,7 +3,6 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// ─── PIN DEFINITIONS ───
 #define SDA_0   8
 #define SCL_0   9
 #define SDA_1   4
@@ -16,7 +15,6 @@
 #define SIM_RST 17
 #define BATTERY_PIN 2
 
-// ─── MPU6050 ───
 #define MPU6050_ADDR 0x68
 #define REG_PWR_MGMT_1 0x6B
 #define REG_SMPLRT_DIV 0x19
@@ -30,7 +28,6 @@
 #define ALPHA 0.98
 #define DT_MAX 2.0
 
-// ─── BMP280 ───
 #define BMP280_ADDR 0x76
 #define BMP280_REG_CHIP_ID 0xD0
 #define BMP280_REG_CALIB 0x88
@@ -38,36 +35,27 @@
 #define BMP280_REG_CONFIG_R 0xF5
 #define BMP280_REG_PRESS_MSB 0xF7
 
-// ─── DS1307 ───
 #define DS1307_ADDR 0x68
 #define DS1307_REG_SEC 0x00
 #define DS1307_REG_CONTROL 0x07
 
-// ─── GPS ───
 #define NMEA_BUF_SIZE 120
 #define GPS_SYNC_INTERVAL_MS 86400000UL
 
-// ─── SIM800L ───
 #define SIM_RESPONSE_BUF_SIZE 256
 #define AT_SUCCESS 0
 #define AT_TIMEOUT 1
 #define AT_ERROR   2
 
-// ─── BATTERY ADC ───
-// Voltage divider: R1=33kΩ (top), R2=100kΩ (bottom)
-// Ratio = (R1+R2)/R2 = 133/100 = 1.33
-// At 4.2V battery: ADC sees 4200/1.33 = 3158mV (safe under 3.3V ref)
-// At 3.0V battery: ADC sees 3000/1.33 = 2256mV
 #define BATTERY_DIVIDER_RATIO  1.33
-#define BATTERY_ADC_SAMPLES    16      // average multiple reads for stability
-#define BATTERY_LOW_THRESH     20.0    // percent — trigger power saving
-#define BATTERY_CRITICAL_THRESH 10.0   // percent — emergency mode
-#define BATTERY_CUTOFF_MV      3000.0  // millivolts — deep sleep to protect cells
-#define BATTERY_CUTOFF_COUNT   3       // consecutive readings below cutoff
+#define BATTERY_ADC_SAMPLES    16
+#define BATTERY_LOW_THRESH     20.0
+#define BATTERY_CRITICAL_THRESH 10.0
+#define BATTERY_CUTOFF_MV      3000.0
+#define BATTERY_CUTOFF_COUNT   3
 
-// ════════════════════════════════════════════════════════
-//  CONFIGURATION
-// ════════════════════════════════════════════════════════
+#define TETHER_LATERAL_THRESH_MS2  0.15
+#define TETHER_ANGLE_THRESH_DEG    3.0
 
 #define FIREBASE_HOST   "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH   ""
@@ -75,11 +63,9 @@
 #define GPRS_APN        "bsnlnet"
 #define STATION_ID      "VARUNA_TEST_01"
 
-// WiFi credentials (fallback transport)
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASS       "YOUR_WIFI_PASSWORD"
 
-// ─── TRANSPORT STATE ───
 #define TRANSPORT_NONE    0
 #define TRANSPORT_GPRS    1
 #define TRANSPORT_WIFI    2
@@ -87,13 +73,11 @@ int activeTransport = TRANSPORT_NONE;
 int transportFailCount = 0;
 #define TRANSPORT_FAIL_THRESHOLD  3
 
-// ─── I2C + UART ───
 TwoWire I2C_0 = TwoWire(0);
 TwoWire I2C_1 = TwoWire(1);
 HardwareSerial GPS_Serial(1);
 HardwareSerial SIM_Serial(2);
 
-// ─── SENSOR DATA ───
 float ax, ay, az, gx, gy, gz, mpuTemp;
 bool mpuHealthy = false;
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
@@ -109,7 +93,6 @@ float filtTiltX = 0, filtTiltY = 0, correctedTiltX = 0, correctedTiltY = 0, thet
 unsigned long prevTime = 0;
 bool filterSeeded = false;
 
-// BMP280
 bool bmpAvailable = false;
 float currentPressure = 0, currentTemperature = 0;
 uint16_t bmpDigT1; int16_t bmpDigT2, bmpDigT3;
@@ -117,12 +100,10 @@ uint16_t bmpDigP1; int16_t bmpDigP2, bmpDigP3, bmpDigP4, bmpDigP5;
 int16_t bmpDigP6, bmpDigP7, bmpDigP8, bmpDigP9;
 int32_t bmpTFine;
 
-// RTC
 bool ds1307Available = false, rtcTimeValid = false, softRtcSet = false;
 uint32_t currentUnixTime = 0, softRtcBaseUnix = 0;
 unsigned long softRtcBaseMillis = 0;
 
-// GPS
 float gpsLat = 0, gpsLon = 0, gpsAlt = 0, gpsSpeed = 0, gpsHdop = 99.9;
 int gpsSatellites = 0;
 bool gpsFixValid = false, gpsTimeValid = false, gpsTimeSynced = false;
@@ -132,31 +113,28 @@ char nmeaBuffer[NMEA_BUF_SIZE];
 int nmeaIndex = 0;
 unsigned long gpsGGACount = 0, gpsRMCCount = 0, gpsChecksumFail = 0, gpsTotalSentences = 0, gpsBytesReceived = 0;
 
-// SIM800L
 char simResponseBuffer[SIM_RESPONSE_BUF_SIZE];
 bool simAvailable = false, simRegistered = false, simCardReady = false;
 int simSignalRSSI = 0;
 bool gprsConnected = false, sslSupported = false;
 
-// WiFi
 bool wifiConnected = false;
 
-// POST stats
 int postSuccessCount = 0, postFailCount = 0;
 
-// ─── BATTERY DATA ───
-float batteryVoltage_mV = 0;    // last measured voltage in millivolts
-float batteryPercent = 0;       // last computed percentage (0-100)
-int   lowVoltageCount = 0;      // consecutive readings below cutoff
-String batteryState = "UNKNOWN"; // GOOD, OK, LOW, CRITICAL, CUTOFF
-// ─── WATER HEIGHT (MODE 1: TAUT TETHER) ───
-float olpLength = 200.0;      // cm — tether length (set at deployment via OLP:<cm>)
-float waterHeight = 0.0;      // cm — computed: L × cos(θ)
-float horizontalDist = 0.0;   // cm — computed: L × sin(θ) (lateral displacement)
+float batteryVoltage_mV = 0;
+float batteryPercent = 0;
+int   lowVoltageCount = 0;
+String batteryState = "UNKNOWN";
 
-// ══════════════════════════════════════════════
-//  MPU6050 SECTION
-// ══════════════════════════════════════════════
+float olpLength = 200.0;
+float waterHeight = 0.0;
+float horizontalDist = 0.0;
+
+float lateralAccel = 0.0;
+float lateralAccel_ms2 = 0.0;
+bool  tetherTaut = false;
+
 
 void mpuWriteReg(uint8_t r, uint8_t v) {
   I2C_0.beginTransmission(MPU6050_ADDR);
@@ -272,11 +250,6 @@ void updateComplementaryFilter() {
   theta = sqrt(correctedTiltX * correctedTiltX + correctedTiltY * correctedTiltY);
 }
 
-
-// ══════════════════════════════════════════════
-//  BMP280 SECTION
-// ══════════════════════════════════════════════
-
 void bmpWriteReg(uint8_t r, uint8_t v) {
   I2C_1.beginTransmission(BMP280_ADDR);
   I2C_1.write(r);
@@ -360,9 +333,6 @@ bool bmpReadData(float *temperature, float *pressure) {
   *pressure = bmpCompensatePress(adcP) / 256.0 / 100.0;
   return true;
 }
-// ══════════════════════════════════════════════
-//  RTC SECTION
-// ══════════════════════════════════════════════
 
 uint8_t bcdToDec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
 uint8_t decToBcd(uint8_t v) { return ((v / 10) << 4) | (v % 10); }
@@ -530,11 +500,6 @@ uint32_t getBestTimestamp() {
   return millis() / 1000;
 }
 
-
-// ══════════════════════════════════════════════
-//  GPS SECTION
-// ══════════════════════════════════════════════
-
 float nmeaToDecimal(float raw, char dir) {
   int deg = (int)(raw / 100);
   float min = raw - (deg * 100.0);
@@ -647,11 +612,6 @@ void initGPS() {
   nmeaIndex = 0;
   Serial.println("  ✓ GPS UART active");
 }
-
-
-// ══════════════════════════════════════════════
-//  SIM800L AT ENGINE
-// ══════════════════════════════════════════════
 
 int send_at_command(const char *cmd, const char *expected, unsigned long timeout_ms) {
   memset(simResponseBuffer, 0, SIM_RESPONSE_BUF_SIZE);
@@ -831,16 +791,10 @@ bool gprsPostToFirebase(const char *payload, int payloadLen) {
   return success;
 }
 
-
-// ══════════════════════════════════════════════
-//  WIFI TRANSPORT (FALLBACK)
-// ══════════════════════════════════════════════
-
 bool initWiFi() {
   Serial.println("\n── WiFi INIT ──");
   if (strcmp(WIFI_SSID, "YOUR_WIFI_SSID") == 0) {
     Serial.println("  ✗ WiFi SSID not configured");
-    Serial.println("    Edit #define WIFI_SSID and WIFI_PASS");
     return false;
   }
   Serial.printf("  Connecting to: %s\n", WIFI_SSID);
@@ -890,18 +844,8 @@ bool wifiPostToFirebase(const char *payload, int payloadLen) {
     return true;
   }
   Serial.printf(" ✗\n  Response: %s\n", response.c_str());
-  if (httpCode == 401) {
-    Serial.println("  → Set RTDB rules to public for testing");
-  } else if (httpCode < 0) {
-    Serial.println("  → Connection failed — check WiFi/URL");
-  }
   return false;
 }
-
-
-// ══════════════════════════════════════════════
-//  UNIFIED TRANSPORT LAYER
-// ══════════════════════════════════════════════
 
 int buildSensorPayload(char *buf, int bufSize) {
   uint32_t ts = getBestTimestamp();
@@ -909,6 +853,8 @@ int buildSensorPayload(char *buf, int bufSize) {
     "{\"station\":\"%s\","
     "\"theta\":%.2f,"
     "\"tiltX\":%.2f,\"tiltY\":%.2f,"
+    "\"waterHeight\":%.1f,\"olpLength\":%.1f,\"horizontalDist\":%.1f,"
+    "\"lateralAccel\":%.4f,\"lateralAccel_ms2\":%.3f,\"tetherTaut\":%s,"
     "\"pressure\":%.2f,\"temperature\":%.1f,"
     "\"gpsLat\":%.6f,\"gpsLon\":%.6f,"
     "\"gpsFix\":%s,\"satellites\":%d,"
@@ -916,6 +862,8 @@ int buildSensorPayload(char *buf, int bufSize) {
     "\"transport\":\"%s\","
     "\"timestamp\":%u,\"uptime\":%lu}",
     STATION_ID, theta, correctedTiltX, correctedTiltY,
+    waterHeight, olpLength, horizontalDist,
+    lateralAccel, lateralAccel_ms2, tetherTaut ? "true" : "false",
     currentPressure, currentTemperature,
     gpsLat, gpsLon,
     gpsFixValid ? "true" : "false", gpsSatellites,
@@ -925,7 +873,7 @@ int buildSensorPayload(char *buf, int bufSize) {
 }
 
 bool postToFirebase() {
-  char payload[400];
+  char payload[450];
   int len = buildSensorPayload(payload, sizeof(payload));
   Serial.printf("\n  ── POST via %s ──\n", activeTransport == TRANSPORT_GPRS ? "GPRS" : "WiFi");
   Serial.printf("  Payload (%d bytes): %s\n", len, payload);
@@ -950,18 +898,14 @@ bool postToFirebase() {
         Serial.println("  GPRS failed 3x → switching to WiFi");
         if (initWiFi()) {
           activeTransport = TRANSPORT_WIFI;
-          Serial.println("  ✓ Now using WiFi");
         } else {
-          Serial.println("  ✗ WiFi also failed — will retry GPRS next cycle");
           gprsInit();
         }
       } else if (activeTransport == TRANSPORT_WIFI) {
         Serial.println("  WiFi failed 3x → switching to GPRS");
         if (simAvailable && gprsInit()) {
           activeTransport = TRANSPORT_GPRS;
-          Serial.println("  ✓ Now using GPRS");
         } else {
-          Serial.println("  ✗ GPRS also failed — retrying WiFi");
           initWiFi();
         }
       }
@@ -979,137 +923,46 @@ void initTransport() {
   if (simOk && simRegistered) {
     if (gprsInit() && gprsConnected) {
       activeTransport = TRANSPORT_GPRS;
-      Serial.println("\n  ═══════════════════════════════════════");
-      Serial.println("  ✓ PRIMARY TRANSPORT: GPRS (cellular)");
-      Serial.println("  ═══════════════════════════════════════\n");
+      Serial.println("\n  ✓ PRIMARY TRANSPORT: GPRS (cellular)\n");
       return;
     }
   }
   Serial.println("\n  SIM800L/GPRS not available — trying WiFi...");
   if (initWiFi()) {
     activeTransport = TRANSPORT_WIFI;
-    Serial.println("\n  ═══════════════════════════════════════");
-    Serial.println("  ✓ FALLBACK TRANSPORT: WiFi");
-    Serial.println("  ═══════════════════════════════════════\n");
+    Serial.println("\n  ✓ FALLBACK TRANSPORT: WiFi\n");
     return;
   }
   activeTransport = TRANSPORT_NONE;
-  Serial.println("\n  ═══════════════════════════════════════");
-  Serial.println("  ✗ NO TRANSPORT AVAILABLE");
-  Serial.println("  Data will be logged locally only");
-  Serial.println("  Will retry periodically");
-  Serial.println("  ═══════════════════════════════════════\n");
+  Serial.println("\n  ✗ NO TRANSPORT AVAILABLE\n");
 }
-// ══════════════════════════════════════════════
-//  BATTERY ADC SECTION — NEW IN STEP 1.10
-// ══════════════════════════════════════════════
-
-// ──────────────────────────────────────────────
-//  READ RAW BATTERY VOLTAGE
-//
-//  Reads GPIO 2 through voltage divider:
-//    Battery+ ─── 33kΩ ──┬── GPIO 2 (ADC)
-//                         │
-//                       100kΩ
-//                         │
-//                        GND
-//
-//  Divider ratio = (33k+100k)/100k = 1.33
-//  ADC reference = 3.3V, 12-bit (0-4095)
-//
-//  Takes BATTERY_ADC_SAMPLES readings and averages
-//  to reduce noise from switching regulators and
-//  SIM800L transmit bursts.
-// ──────────────────────────────────────────────
 
 float readBatteryVoltage() {
   uint32_t sum = 0;
-
   for (int i = 0; i < BATTERY_ADC_SAMPLES; i++) {
     sum += analogRead(BATTERY_PIN);
-    delayMicroseconds(500);  // small delay between samples for ADC settling
+    delayMicroseconds(500);
   }
-
   float avgReading = (float)sum / BATTERY_ADC_SAMPLES;
-
-  // convert 12-bit ADC reading to voltage at ADC pin (mV)
   float adcVoltage_mV = avgReading * 3300.0 / 4095.0;
-
-  // undo voltage divider to get actual battery voltage
   float battery_mV = adcVoltage_mV * BATTERY_DIVIDER_RATIO;
-
   return battery_mV;
 }
 
-// ──────────────────────────────────────────────
-//  PIECEWISE LI-ION DISCHARGE CURVE
-//
-//  Li-ion discharge is NOT linear.
-//  Using 6-segment piecewise approximation:
-//
-//  Voltage
-//  4.2V ┤■■
-//       │  ■■■
-//  4.0V ┤     ■■■■
-//       │          ■■■■■■■■■■■■■■■   ← Flat plateau
-//  3.7V ┤                         ■■■
-//       │                            ■■■
-//  3.5V ┤                               ■■
-//       │                                 ■■
-//  3.3V ┤                                   ■■
-//       │                                     ■■■
-//  3.0V ┤                                        ■
-//       └──────────────────────────────────────────
-//       0%    20%    40%    60%    80%    100%
-// ──────────────────────────────────────────────
-
 float batteryPercentage(float voltage_mV) {
   float pct;
-
-  if (voltage_mV >= 4200.0) {
-    pct = 100.0;
-  }
-  else if (voltage_mV >= 4100.0) {
-    // 4100-4200mV → 90-100%  (steep initial drop)
-    pct = 90.0 + (voltage_mV - 4100.0) * 10.0 / 100.0;
-  }
-  else if (voltage_mV >= 3850.0) {
-    // 3850-4100mV → 70-90%  (gradual)
-    pct = 70.0 + (voltage_mV - 3850.0) * 20.0 / 250.0;
-  }
-  else if (voltage_mV >= 3700.0) {
-    // 3700-3850mV → 40-70%  (flat plateau region)
-    pct = 40.0 + (voltage_mV - 3700.0) * 30.0 / 150.0;
-  }
-  else if (voltage_mV >= 3500.0) {
-    // 3500-3700mV → 20-40%  (starting to drop)
-    pct = 20.0 + (voltage_mV - 3500.0) * 20.0 / 200.0;
-  }
-  else if (voltage_mV >= 3300.0) {
-    // 3300-3500mV → 5-20%  (dropping faster)
-    pct = 5.0 + (voltage_mV - 3300.0) * 15.0 / 200.0;
-  }
-  else if (voltage_mV >= 3000.0) {
-    // 3000-3300mV → 0-5%  (steep final drop)
-    pct = 0.0 + (voltage_mV - 3000.0) * 5.0 / 300.0;
-  }
-  else {
-    pct = 0.0;
-  }
-
-  // clamp to 0-100
+  if (voltage_mV >= 4200.0) pct = 100.0;
+  else if (voltage_mV >= 4100.0) pct = 90.0 + (voltage_mV - 4100.0) * 10.0 / 100.0;
+  else if (voltage_mV >= 3850.0) pct = 70.0 + (voltage_mV - 3850.0) * 20.0 / 250.0;
+  else if (voltage_mV >= 3700.0) pct = 40.0 + (voltage_mV - 3700.0) * 30.0 / 150.0;
+  else if (voltage_mV >= 3500.0) pct = 20.0 + (voltage_mV - 3500.0) * 20.0 / 200.0;
+  else if (voltage_mV >= 3300.0) pct = 5.0 + (voltage_mV - 3300.0) * 15.0 / 200.0;
+  else if (voltage_mV >= 3000.0) pct = 0.0 + (voltage_mV - 3000.0) * 5.0 / 300.0;
+  else pct = 0.0;
   if (pct > 100.0) pct = 100.0;
   if (pct < 0.0) pct = 0.0;
-
   return pct;
 }
-
-// ──────────────────────────────────────────────
-//  CLASSIFY BATTERY STATE
-//
-//  Returns human-readable state string and
-//  handles low-voltage cutoff protection.
-// ──────────────────────────────────────────────
 
 String classifyBatteryState(float voltage_mV, float percent) {
   if (voltage_mV >= 3850.0) return "GOOD";
@@ -1119,87 +972,33 @@ String classifyBatteryState(float voltage_mV, float percent) {
   return "CUTOFF";
 }
 
-// ──────────────────────────────────────────────
-//  FULL BATTERY UPDATE
-//
-//  Reads voltage, computes percentage, classifies
-//  state, handles cutoff protection.
-//
-//  Call every 30 seconds from loop().
-// ──────────────────────────────────────────────
-
 void updateBattery() {
   batteryVoltage_mV = readBatteryVoltage();
   batteryPercent = batteryPercentage(batteryVoltage_mV);
   batteryState = classifyBatteryState(batteryVoltage_mV, batteryPercent);
-
-  // low-voltage cutoff protection
-  // 3 consecutive readings below 3.0V → deep sleep to protect cells
   if (batteryVoltage_mV < BATTERY_CUTOFF_MV) {
     lowVoltageCount++;
     if (lowVoltageCount >= BATTERY_CUTOFF_COUNT) {
-      Serial.println("\n  ╔════════════════════════════════════════════╗");
-      Serial.println("  ║  BATTERY CUTOFF — ENTERING DEEP SLEEP     ║");
-      Serial.printf( "  ║  Voltage: %.0f mV (%.1f%%)                  \n", batteryVoltage_mV, batteryPercent);
-      Serial.println("  ║  3 consecutive readings below 3.0V        ║");
-      Serial.println("  ║  Protecting cells from deep discharge     ║");
-      Serial.println("  ╚════════════════════════════════════════════╝\n");
-
-      // TODO: forceSaveEeprom() will be added in Phase 7
-      // TODO: turn off obstruction lights (Phase ?)
-      // TODO: turn off status LED
-
+      Serial.println("\n  BATTERY CUTOFF — ENTERING DEEP SLEEP");
       Serial.flush();
       delay(100);
-      esp_deep_sleep_start();  // no timer = sleep until manual reset/power cycle
+      esp_deep_sleep_start();
     }
   } else {
-    lowVoltageCount = 0;  // reset on any good reading
+    lowVoltageCount = 0;
   }
 }
-
-// ──────────────────────────────────────────────
-//  BATTERY INIT
-// ──────────────────────────────────────────────
 
 void initBattery() {
   Serial.println("\n── BATTERY ADC INIT ──");
-
-  analogReadResolution(12);  // 0-4095
+  analogReadResolution(12);
   pinMode(BATTERY_PIN, INPUT);
-
-  // take initial reading
   updateBattery();
-
-  Serial.printf("  ADC pin:    GPIO %d\n", BATTERY_PIN);
-  Serial.printf("  Divider:    R1=33kΩ  R2=100kΩ  ratio=%.2f\n", BATTERY_DIVIDER_RATIO);
-  Serial.printf("  Samples:    %d (averaged)\n", BATTERY_ADC_SAMPLES);
-  Serial.printf("  Voltage:    %.0f mV\n", batteryVoltage_mV);
-  Serial.printf("  Percentage: %.1f%%\n", batteryPercent);
-  Serial.printf("  State:      %s\n", batteryState.c_str());
-  Serial.printf("  Thresholds: LOW=%.0f%%  CRITICAL=%.0f%%  CUTOFF=%.0fmV\n",
-                BATTERY_LOW_THRESH, BATTERY_CRITICAL_THRESH, BATTERY_CUTOFF_MV);
-
-  // warn if battery looks disconnected (reading near 0)
-  if (batteryVoltage_mV < 500.0) {
-    Serial.println("  ⚠ Battery voltage very low — battery may not be connected");
-    Serial.println("    If testing without battery, readings will show 0%");
-    Serial.println("    This is expected — battery monitoring still functional");
-  }
-
-  // warn if reading seems too high (possible short or wrong divider)
-  if (batteryVoltage_mV > 4400.0) {
-    Serial.println("  ⚠ Battery voltage unusually high (>4.4V)");
-    Serial.println("    Check voltage divider resistor values");
-  }
-
+  Serial.printf("  Voltage: %.0f mV  Percent: %.1f%%  State: %s\n",
+                batteryVoltage_mV, batteryPercent, batteryState.c_str());
+  if (batteryVoltage_mV < 500.0) Serial.println("  ⚠ Battery may not be connected");
   Serial.println("  ✓ BATTERY ADC READY");
 }
-
-
-// ══════════════════════════════════════════════
-//  SETUP
-// ══════════════════════════════════════════════
 
 void setup() {
   Serial.begin(115200);
@@ -1207,34 +1006,23 @@ void setup() {
 
   Serial.println();
   Serial.println("┌──────────────────────────────────────────────────┐");
-  Serial.println("│   VARUNA — Step 1.10: Battery ADC Reading       │");
+  Serial.println("│   VARUNA — Step 2.2: Lateral Accel + Tether     │");
   Serial.println("└──────────────────────────────────────────────────┘");
 
   I2C_0.begin(SDA_0, SCL_0, 100000);
   I2C_1.begin(SDA_1, SCL_1, 100000);
   Serial.println("\nI2C buses initialised");
 
-  // ── MPU6050 ──
   Serial.println("\n── MPU6050 INIT ──");
   if (!initMPU6050()) { Serial.println("HALT"); while (1) delay(1000); }
   recalibrate();
 
-  // ── BMP280 ──
   initBMP280();
-
-  // ── RTC ──
   initRTC();
-
-  // ── GPS ──
   initGPS();
-
-  // ── Battery ADC ──
   initBattery();
-
-  // ── Transport (GPRS → WiFi fallback) ──
   initTransport();
 
-  // ── test post ──
   if (activeTransport != TRANSPORT_NONE) {
     Serial.println("\n── INITIAL FIREBASE TEST POST ──");
     postToFirebase();
@@ -1244,18 +1032,11 @@ void setup() {
 
   Serial.println("\n══════════════════════════════════════════════════");
   Serial.println("  LIVE OUTPUT — 2 Hz");
-  Serial.printf("  Transport: %s\n",
-                activeTransport == TRANSPORT_GPRS ? "GPRS" :
-                activeTransport == TRANSPORT_WIFI ? "WiFi" : "NONE");
-  Serial.println("  Firebase POST every 30 seconds");
-  Serial.println("  Battery check every 30 seconds");
+  Serial.printf("  OLP Length: %.1f cm\n", olpLength);
+  Serial.printf("  Tether thresholds: lateral>%.2f m/s²  AND  θ>%.1f°\n",
+                TETHER_LATERAL_THRESH_MS2, TETHER_ANGLE_THRESH_DEG);
   Serial.println("══════════════════════════════════════════════════\n");
 }
-
-
-// ══════════════════════════════════════════════
-//  LOOP
-// ══════════════════════════════════════════════
 
 unsigned long lastPrint = 0;
 unsigned long lastBmpRead = 0;
@@ -1265,57 +1046,54 @@ unsigned long lastFirebasePost = 0;
 unsigned long lastTransportRetry = 0;
 unsigned long lastBatteryRead = 0;
 
-#define FIREBASE_POST_INTERVAL   30000   // 30 seconds for testing
-#define TRANSPORT_RETRY_INTERVAL 120000  // retry dead transport every 2 min
-#define BATTERY_READ_INTERVAL    30000   // read battery every 30 seconds
+#define FIREBASE_POST_INTERVAL   30000
+#define TRANSPORT_RETRY_INTERVAL 120000
+#define BATTERY_READ_INTERVAL    30000
 
 int rtcYear, rtcMonth, rtcDay, rtcHour, rtcMin, rtcSec;
 
 void loop() {
   if (!mpuHealthy || !calibrated) { delay(1000); return; }
 
-  // ── GPS (non-blocking) ──
   processGPS();
   syncRTCfromGPS();
 
-  // ── MPU + filter ──
   if (!readMPU6050()) { delay(10); return; }
   updateComplementaryFilter();
 
-  // ── BMP280 every 2s ──
+  waterHeight = olpLength * cos(theta * PI / 180.0);
+  horizontalDist = olpLength * sin(theta * PI / 180.0);
+
+  lateralAccel = sqrt(ax * ax + ay * ay);
+  lateralAccel_ms2 = lateralAccel * 9.81;
+  tetherTaut = (lateralAccel_ms2 > TETHER_LATERAL_THRESH_MS2) && (theta > TETHER_ANGLE_THRESH_DEG);
+
   if (bmpAvailable && (millis() - lastBmpRead >= 2000)) {
     lastBmpRead = millis();
     bmpReadData(&currentTemperature, &currentPressure);
   }
 
-  // ── RTC every 1s ──
   if (millis() - lastRtcRead >= 1000) {
     lastRtcRead = millis();
     readRTC(rtcYear, rtcMonth, rtcDay, rtcHour, rtcMin, rtcSec);
   }
 
-  // ── Battery every 30s ──
   if (millis() - lastBatteryRead >= BATTERY_READ_INTERVAL) {
     lastBatteryRead = millis();
     updateBattery();
   }
 
-  // ── periodic Firebase POST ──
   if (activeTransport != TRANSPORT_NONE && (millis() - lastFirebasePost >= FIREBASE_POST_INTERVAL)) {
     lastFirebasePost = millis();
     postToFirebase();
   }
 
-  // ── retry transport if none active ──
   if (activeTransport == TRANSPORT_NONE && (millis() - lastTransportRetry >= TRANSPORT_RETRY_INTERVAL)) {
     lastTransportRetry = millis();
-    Serial.println("\n  Retrying transport connection...");
     initTransport();
   }
 
-  // ── WiFi reconnect check ──
   if (activeTransport == TRANSPORT_WIFI && WiFi.status() != WL_CONNECTED) {
-    Serial.println("  ⚠ WiFi disconnected — reconnecting...");
     WiFi.reconnect();
     delay(3000);
     if (WiFi.status() != WL_CONNECTED) {
@@ -1324,14 +1102,16 @@ void loop() {
     }
   }
 
-  // ── print at 2 Hz ──
   if (millis() - lastPrint >= 500) {
     lastPrint = millis();
 
     char timeStr[32];
     formatDateTime(currentUnixTime, timeStr, sizeof(timeStr));
 
-    Serial.printf("θ%6.2f° | ", theta);
+    Serial.printf("θ%6.2f° H=%6.1fcm %s | ",
+                  theta, waterHeight, tetherTaut ? "TAUT" : "SLACK");
+
+    Serial.printf("la=%.3fg %.2fm/s² | ", lateralAccel, lateralAccel_ms2);
 
     if (bmpAvailable && currentPressure > 0)
       Serial.printf("%.1fhPa %.1f°C | ", currentPressure, currentTemperature);
@@ -1343,7 +1123,6 @@ void loop() {
     else
       Serial.print("GPS:-- | ");
 
-    // transport indicator
     if (activeTransport == TRANSPORT_GPRS)
       Serial.printf("GPRS r:%d | ", simSignalRSSI);
     else if (activeTransport == TRANSPORT_WIFI)
@@ -1351,28 +1130,33 @@ void loop() {
     else
       Serial.print("NO_NET | ");
 
-    // battery
-    Serial.printf("BAT:%.0fmV %.0f%% %s | ", batteryVoltage_mV, batteryPercent, batteryState.c_str());
+    Serial.printf("BAT:%.0fmV %.0f%% | ", batteryVoltage_mV, batteryPercent);
 
     Serial.printf("FB:ok%d fail%d", postSuccessCount, postFailCount);
     Serial.println();
   }
 
-  // ── GPS status every 30s ──
   if (millis() - lastGpsPrint >= 30000) {
     lastGpsPrint = millis();
     Serial.printf("  GPS: fix:%s sats:%d hdop:%.1f synced:%s\n",
                   gpsFixValid ? "Y" : "N", gpsSatellites, gpsHdop, gpsTimeSynced ? "Y" : "N");
 
-    // also print detailed battery status every 30s
     Serial.println("  ┌── BATTERY ─────────────────────────────────────┐");
-    Serial.printf( "  │  Voltage:  %.0f mV\n", batteryVoltage_mV);
-    Serial.printf( "  │  Percent:  %.1f%%\n", batteryPercent);
-    Serial.printf( "  │  State:    %s\n", batteryState.c_str());
-    if (batteryState == "LOW")
-      Serial.println("  │  ⚠ Consider charging or reducing intervals");
-    if (batteryState == "CRITICAL")
-      Serial.println("  │  ⚠ CRITICAL — emergency mode recommended");
+    Serial.printf( "  │  Voltage: %.0f mV  Percent: %.1f%%  State: %s\n",
+                   batteryVoltage_mV, batteryPercent, batteryState.c_str());
+    Serial.println("  └────────────────────────────────────────────────┘");
+
+    Serial.println("  ┌── WATER HEIGHT ────────────────────────────────┐");
+    Serial.printf( "  │  OLP: %.1fcm  θ: %.2f°  H: %.1fcm  Horiz: %.1fcm\n",
+                   olpLength, theta, waterHeight, horizontalDist);
+    Serial.printf( "  │  H/L: %.3f\n", waterHeight / olpLength);
+    Serial.println("  └────────────────────────────────────────────────┘");
+
+    Serial.println("  ┌── TETHER STATUS ───────────────────────────────┐");
+    Serial.printf( "  │  Lateral accel: %.4f g  (%.3f m/s²)\n", lateralAccel, lateralAccel_ms2);
+    Serial.printf( "  │  Threshold:     %.3f m/s²  AND  θ > %.1f°\n",
+                   TETHER_LATERAL_THRESH_MS2, TETHER_ANGLE_THRESH_DEG);
+    Serial.printf( "  │  Tether state:  %s\n", tetherTaut ? "TAUT ──── (under tension)" : "SLACK ~~~~ (floating free)");
     Serial.println("  └────────────────────────────────────────────────┘");
   }
 
