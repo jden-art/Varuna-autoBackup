@@ -81,6 +81,10 @@
 #define RATE_CLAMP_MAX 200.0
 #define RATE_MIN_ELAPSED_SEC 60.0
 
+#define SUSTAINED_BUF_SIZE       4
+#define SUSTAINED_RISE_THRESH    0.5
+#define SUSTAINED_RISE_MIN_PAIRS 2
+
 #define FIREBASE_HOST   "varuna-flood-default-rtdb.asia-southeast1.firebasedatabase.app"
 #define FIREBASE_AUTH   ""
 #define FIREBASE_PATH   "/varuna/live"
@@ -183,6 +187,12 @@ float ratePer15Min = 0.0;
 int   currentRateCategory = RATE_SLOW;
 
 const char* rateNames[] = {"SLOW", "MODERATE", "FAST"};
+
+float sustainedBuffer[SUSTAINED_BUF_SIZE];
+uint32_t sustainedTimeBuffer[SUSTAINED_BUF_SIZE];
+int sustainedBufIndex = 0;
+int sustainedBufCount = 0;
+bool sustainedRise = false;
 
 
 void mpuWriteReg(uint8_t r, uint8_t v) {
@@ -502,6 +512,32 @@ int classifyRate(float rate) {
   if (rate < 2.0) return RATE_SLOW;
   if (rate < 5.0) return RATE_MODERATE;
   return RATE_FAST;
+}
+
+void updateSustainedBuffer(float height, uint32_t timestamp) {
+  sustainedBuffer[sustainedBufIndex] = height;
+  sustainedTimeBuffer[sustainedBufIndex] = timestamp;
+  sustainedBufIndex = (sustainedBufIndex + 1) % SUSTAINED_BUF_SIZE;
+  if (sustainedBufCount < SUSTAINED_BUF_SIZE) sustainedBufCount++;
+
+  if (sustainedBufCount < SUSTAINED_BUF_SIZE) {
+    sustainedRise = false;
+    return;
+  }
+
+  float ordered[SUSTAINED_BUF_SIZE];
+  for (int i = 0; i < SUSTAINED_BUF_SIZE; i++) {
+    ordered[i] = sustainedBuffer[(sustainedBufIndex + i) % SUSTAINED_BUF_SIZE];
+  }
+
+  bool netRising = (ordered[SUSTAINED_BUF_SIZE - 1] > ordered[0] + SUSTAINED_RISE_THRESH);
+
+  int riseCount = 0;
+  for (int i = 1; i < SUSTAINED_BUF_SIZE; i++) {
+    if (ordered[i] > ordered[i - 1] + SUSTAINED_RISE_THRESH) riseCount++;
+  }
+
+  sustainedRise = netRising && (riseCount >= SUSTAINED_RISE_MIN_PAIRS);
 }
 
 uint8_t bcdToDec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
@@ -1023,6 +1059,7 @@ int buildSensorPayload(char *buf, int bufSize) {
     "\"mode\":%d,\"modeName\":\"%s\","
     "\"zone\":%d,\"zoneName\":\"%s\","
     "\"ratePer15Min\":%.2f,\"rateCategory\":%d,\"rateName\":\"%s\","
+    "\"sustainedRise\":%s,"
     "\"pressureDeviation\":%.2f,\"estimatedDepth\":%.1f,"
     "\"baselinePressure\":%.2f,"
     "\"pressure\":%.2f,\"temperature\":%.1f,"
@@ -1037,6 +1074,7 @@ int buildSensorPayload(char *buf, int bufSize) {
     currentMode, modeNames[currentMode],
     currentZone, zoneNames[currentZone],
     ratePer15Min, currentRateCategory, rateNames[currentRateCategory],
+    sustainedRise ? "true" : "false",
     pressureDeviation, estimatedDepth,
     baselinePressure,
     currentPressure, currentTemperature,
@@ -1048,7 +1086,7 @@ int buildSensorPayload(char *buf, int bufSize) {
 }
 
 bool postToFirebase() {
-  char payload[600];
+  char payload[700];
   int len = buildSensorPayload(payload, sizeof(payload));
   bool success = false;
   if (activeTransport == TRANSPORT_GPRS) {
@@ -1166,7 +1204,7 @@ void setup() {
 
   Serial.println();
   Serial.println("┌──────────────────────────────────────────────────┐");
-  Serial.println("│   VARUNA — Step 3.1+3.2: Zone + Rate            │");
+  Serial.println("│   VARUNA — Phase 3 Step 3: Sustained Rise       │");
   Serial.println("└──────────────────────────────────────────────────┘");
 
   I2C_0.begin(SDA_0, SCL_0, 100000);
@@ -1184,6 +1222,19 @@ void setup() {
   initBattery();
   initTransport();
 
+  for (int i = 0; i < SUSTAINED_BUF_SIZE; i++) {
+    sustainedBuffer[i] = 0.0;
+    sustainedTimeBuffer[i] = 0;
+  }
+  sustainedBufIndex = 0;
+  sustainedBufCount = 0;
+  sustainedRise = false;
+  Serial.println("\n── SUSTAINED RISE BUFFER INIT ──");
+  Serial.printf("  Buffer size: %d readings\n", SUSTAINED_BUF_SIZE);
+  Serial.printf("  Rise threshold: %.1f cm between consecutive readings\n", SUSTAINED_RISE_THRESH);
+  Serial.printf("  Min rising pairs: %d of %d\n", SUSTAINED_RISE_MIN_PAIRS, SUSTAINED_BUF_SIZE - 1);
+  Serial.println("  ✓ SUSTAINED BUFFER READY");
+
   if (activeTransport != TRANSPORT_NONE) {
     postToFirebase();
   }
@@ -1195,6 +1246,8 @@ void setup() {
   Serial.printf("  Zones: ALERT=%.0f  WARNING=%.0f  DANGER=%.0f cm\n",
                 alertLevelCm, warningLevelCm, dangerLevelCm);
   Serial.printf("  Rates: SLOW<2  MODERATE<5  FAST≥5 cm/15min\n");
+  Serial.printf("  Sustained: %d readings, %.1fcm thresh, %d min pairs\n",
+                SUSTAINED_BUF_SIZE, SUSTAINED_RISE_THRESH, SUSTAINED_RISE_MIN_PAIRS);
   Serial.println("══════════════════════════════════════════════════\n");
 }
 
@@ -1205,10 +1258,12 @@ unsigned long lastGpsPrint = 0;
 unsigned long lastFirebasePost = 0;
 unsigned long lastTransportRetry = 0;
 unsigned long lastBatteryRead = 0;
+unsigned long lastSustainedUpdate = 0;
 
 #define FIREBASE_POST_INTERVAL   30000
 #define TRANSPORT_RETRY_INTERVAL 120000
 #define BATTERY_READ_INTERVAL    30000
+#define SUSTAINED_UPDATE_INTERVAL 10000
 
 int rtcYear, rtcMonth, rtcDay, rtcHour, rtcMin, rtcSec;
 
@@ -1235,6 +1290,11 @@ void loop() {
   currentZone = classifyZone(waterHeight);
   calculateRateOfChange(waterHeight, millis());
   currentRateCategory = classifyRate(ratePer15Min);
+
+  if (millis() - lastSustainedUpdate >= SUSTAINED_UPDATE_INTERVAL) {
+    lastSustainedUpdate = millis();
+    updateSustainedBuffer(waterHeight, getBestTimestamp());
+  }
 
   if (millis() - lastRtcRead >= 1000) {
     lastRtcRead = millis();
@@ -1271,10 +1331,11 @@ void loop() {
     char timeStr[32];
     formatDateTime(currentUnixTime, timeStr, sizeof(timeStr));
 
-    Serial.printf("M%d(%s) Z%d(%s) R:%s %+.1f | ",
+    Serial.printf("M%d(%s) Z%d(%s) R:%s %+.1f S:%s | ",
                   currentMode, modeNames[currentMode],
                   currentZone, zoneNames[currentZone],
-                  rateNames[currentRateCategory], ratePer15Min);
+                  rateNames[currentRateCategory], ratePer15Min,
+                  sustainedRise ? "YES" : "no");
 
     Serial.printf("θ%6.2f° H=%6.1fcm | ", theta, waterHeight);
 
@@ -1308,6 +1369,16 @@ void loop() {
     Serial.printf( "  │  Mode:       %d (%s)\n", currentMode, modeNames[currentMode]);
     Serial.printf( "  │  Zone:       %d (%s)\n", currentZone, zoneNames[currentZone]);
     Serial.printf( "  │  Rate:       %+.2f cm/15min (%s)\n", ratePer15Min, rateNames[currentRateCategory]);
+    Serial.printf( "  │  Sustained:  %s (buf:%d/%d)\n", sustainedRise ? "YES ▲▲▲" : "no", sustainedBufCount, SUSTAINED_BUF_SIZE);
+    if (sustainedBufCount > 0) {
+      Serial.print("  │  Buffer:     [");
+      for (int i = 0; i < sustainedBufCount; i++) {
+        int idx = (sustainedBufIndex - sustainedBufCount + i + SUSTAINED_BUF_SIZE) % SUSTAINED_BUF_SIZE;
+        if (i > 0) Serial.print(", ");
+        Serial.printf("%.1f", sustainedBuffer[idx]);
+      }
+      Serial.println("]");
+    }
     Serial.printf( "  │  Height:     %.1f cm\n", waterHeight);
     Serial.printf( "  │  OLP:        %.1f cm\n", olpLength);
     Serial.printf( "  │  H/L:        %.3f\n", olpLength > 0 ? waterHeight / olpLength : 0);
