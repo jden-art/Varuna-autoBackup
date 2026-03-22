@@ -1,3 +1,4 @@
+//---------------------------PHASE 3 Step 2-------------------------------
 #include <Wire.h>
 #include <HardwareSerial.h>
 #include <WiFi.h>
@@ -538,6 +539,188 @@ void updateSustainedBuffer(float height, uint32_t timestamp) {
   }
 
   sustainedRise = netRising && (riseCount >= SUSTAINED_RISE_MIN_PAIRS);
+}
+
+void verifyZoneClassification() {
+  Serial.println("\n── ZONE CLASSIFICATION VERIFICATION ──");
+  Serial.printf("  Thresholds: ALERT=%.0f  WARNING=%.0f  DANGER=%.0f cm\n",
+                alertLevelCm, warningLevelCm, dangerLevelCm);
+
+  struct ZoneTest {
+    float height;
+    int expectedZone;
+  };
+
+  ZoneTest tests[] = {
+    {  50.0, ZONE_NORMAL  },
+    { 130.0, ZONE_ALERT   },
+    { 200.0, ZONE_WARNING },
+    { 260.0, ZONE_DANGER  },
+    {   0.0, ZONE_NORMAL  },
+    { 119.9, ZONE_NORMAL  },
+    { 120.0, ZONE_ALERT   },
+    { 179.9, ZONE_ALERT   },
+    { 180.0, ZONE_WARNING },
+    { 249.9, ZONE_WARNING },
+    { 250.0, ZONE_DANGER  },
+    { 999.0, ZONE_DANGER  }
+  };
+
+  int totalTests = sizeof(tests) / sizeof(tests[0]);
+  int passed = 0;
+
+  for (int i = 0; i < totalTests; i++) {
+    int result = classifyZone(tests[i].height);
+    bool ok = (result == tests[i].expectedZone);
+    if (ok) passed++;
+    Serial.printf("  classifyZone(%.1f) = %d (%s) expected %d (%s) %s\n",
+                  tests[i].height,
+                  result, zoneNames[result],
+                  tests[i].expectedZone, zoneNames[tests[i].expectedZone],
+                  ok ? "✓" : "✗ FAIL");
+  }
+
+  Serial.printf("  Result: %d/%d passed\n", passed, totalTests);
+  if (passed == totalTests) {
+    Serial.println("  ✓ ZONE CLASSIFICATION VERIFIED");
+  } else {
+    Serial.println("  ✗ ZONE CLASSIFICATION HAS ERRORS");
+  }
+}
+
+void verifyRateOfChange() {
+  Serial.println("\n── RATE OF CHANGE VERIFICATION ──");
+  Serial.printf("  Thresholds: SLOW<2  MODERATE<5  FAST≥5 cm/15min\n");
+  Serial.printf("  Min elapsed: %.0f sec  Clamp: ±%.0f cm/15min\n",
+                RATE_MIN_ELAPSED_SEC, RATE_CLAMP_MAX);
+
+  // Save live state
+  float savedPrevHeight = previousHeight;
+  unsigned long savedPrevTime = previousHeightTime;
+  float savedRate = ratePer15Min;
+
+  Serial.println("\n  -- classifyRate() unit tests --");
+
+  struct RateTest {
+    float rate;
+    int expectedCategory;
+  };
+
+  RateTest rateTests[] = {
+    { -5.0,  RATE_SLOW     },
+    { -0.1,  RATE_SLOW     },
+    {  0.0,  RATE_SLOW     },
+    {  1.0,  RATE_SLOW     },
+    {  1.99, RATE_SLOW     },
+    {  2.0,  RATE_MODERATE },
+    {  3.5,  RATE_MODERATE },
+    {  4.99, RATE_MODERATE },
+    {  5.0,  RATE_FAST     },
+    { 10.0,  RATE_FAST     },
+    { 50.0,  RATE_FAST     }
+  };
+
+  int totalRateTests = sizeof(rateTests) / sizeof(rateTests[0]);
+  int ratePassed = 0;
+
+  for (int i = 0; i < totalRateTests; i++) {
+    int result = classifyRate(rateTests[i].rate);
+    bool ok = (result == rateTests[i].expectedCategory);
+    if (ok) ratePassed++;
+    Serial.printf("  classifyRate(%+.2f) = %d (%s) expected %d (%s) %s\n",
+                  rateTests[i].rate,
+                  result, rateNames[result],
+                  rateTests[i].expectedCategory, rateNames[rateTests[i].expectedCategory],
+                  ok ? "✓" : "✗ FAIL");
+  }
+
+  Serial.printf("  classifyRate result: %d/%d passed\n", ratePassed, totalRateTests);
+
+  Serial.println("\n  -- calculateRateOfChange() simulation --");
+
+  // Test 1: First call initializes, rate stays 0
+  previousHeight = -1.0;
+  previousHeightTime = 0;
+  ratePer15Min = 0.0;
+
+  calculateRateOfChange(100.0, 0);
+  bool t1 = (ratePer15Min == 0.0 && previousHeight == 100.0);
+  Serial.printf("  T1 init:      h=100 t=0     → rate=%.2f prevH=%.1f %s\n",
+                ratePer15Min, previousHeight, t1 ? "✓" : "✗ FAIL");
+
+  // Test 2: Too soon (30s < 60s minimum), rate unchanged
+  calculateRateOfChange(105.0, 30000);
+  bool t2 = (ratePer15Min == 0.0 && previousHeight == 100.0);
+  Serial.printf("  T2 too soon:   h=105 t=30s   → rate=%.2f (skipped, <60s) %s\n",
+                ratePer15Min, t2 ? "✓" : "✗ FAIL");
+
+  // Test 3: Rising 2cm over 60s = 2*(900/60) = 30 cm/15min → FAST
+  calculateRateOfChange(102.0, 60000);
+  float expectedRate3 = 2.0 * (900.0 / 60.0);
+  bool t3 = (fabs(ratePer15Min - expectedRate3) < 0.01);
+  int cat3 = classifyRate(ratePer15Min);
+  Serial.printf("  T3 60s rise:   h=102 t=60s   → rate=%.2f (exp %.2f) cat=%s %s\n",
+                ratePer15Min, expectedRate3, rateNames[cat3], t3 ? "✓" : "✗ FAIL");
+
+  // Test 4: Rising 2cm over 240s = 2*(900/240) = 7.5 cm/15min → FAST
+  previousHeight = 100.0;
+  previousHeightTime = 0;
+  ratePer15Min = 0.0;
+  calculateRateOfChange(102.0, 240000);
+  float expectedRate4 = 2.0 * (900.0 / 240.0);
+  bool t4 = (fabs(ratePer15Min - expectedRate4) < 0.01);
+  int cat4 = classifyRate(ratePer15Min);
+  Serial.printf("  T4 4min rise:  h=102 t=240s  → rate=%.2f (exp %.2f) cat=%s %s\n",
+                ratePer15Min, expectedRate4, rateNames[cat4], t4 ? "✓" : "✗ FAIL");
+
+  // Test 5: Rising 2cm over 900s = exactly 2.0 cm/15min → MODERATE
+  previousHeight = 100.0;
+  previousHeightTime = 0;
+  ratePer15Min = 0.0;
+  calculateRateOfChange(102.0, 900000);
+  float expectedRate5 = 2.0 * (900.0 / 900.0);
+  bool t5 = (fabs(ratePer15Min - expectedRate5) < 0.01);
+  int cat5 = classifyRate(ratePer15Min);
+  Serial.printf("  T5 15min rise: h=102 t=900s  → rate=%.2f (exp %.2f) cat=%s %s\n",
+                ratePer15Min, expectedRate5, rateNames[cat5], t5 ? "✓" : "✗ FAIL");
+
+  // Test 6: Falling 3cm over 120s = -3*(900/120) = -22.5 → SLOW (falling=slow)
+  previousHeight = 200.0;
+  previousHeightTime = 0;
+  ratePer15Min = 0.0;
+  calculateRateOfChange(197.0, 120000);
+  float expectedRate6 = -3.0 * (900.0 / 120.0);
+  bool t6 = (fabs(ratePer15Min - expectedRate6) < 0.01);
+  int cat6 = classifyRate(ratePer15Min);
+  Serial.printf("  T6 falling:    h=197 t=120s  → rate=%.2f (exp %.2f) cat=%s %s\n",
+                ratePer15Min, expectedRate6, rateNames[cat6], t6 ? "✓" : "✗ FAIL");
+
+  // Test 7: Glitch clamp — huge jump clamped to 0
+  previousHeight = 100.0;
+  previousHeightTime = 0;
+  ratePer15Min = 0.0;
+  calculateRateOfChange(500.0, 60000);
+  bool t7 = (ratePer15Min == 0.0);
+  Serial.printf("  T7 glitch:     h=500 t=60s   → rate=%.2f (clamped to 0) %s\n",
+                ratePer15Min, t7 ? "✓" : "✗ FAIL");
+
+  int simPassed = (t1 ? 1 : 0) + (t2 ? 1 : 0) + (t3 ? 1 : 0) +
+                  (t4 ? 1 : 0) + (t5 ? 1 : 0) + (t6 ? 1 : 0) + (t7 ? 1 : 0);
+  Serial.printf("  Simulation result: %d/7 passed\n", simPassed);
+
+  int totalPassed = ratePassed + simPassed;
+  int totalAll = totalRateTests + 7;
+  Serial.printf("\n  OVERALL: %d/%d passed\n", totalPassed, totalAll);
+  if (totalPassed == totalAll) {
+    Serial.println("  ✓ RATE OF CHANGE VERIFIED");
+  } else {
+    Serial.println("  ✗ RATE OF CHANGE HAS ERRORS");
+  }
+
+  // Restore live state
+  previousHeight = savedPrevHeight;
+  previousHeightTime = savedPrevTime;
+  ratePer15Min = savedRate;
 }
 
 uint8_t bcdToDec(uint8_t v) { return ((v >> 4) * 10) + (v & 0x0F); }
@@ -1204,7 +1387,7 @@ void setup() {
 
   Serial.println();
   Serial.println("┌──────────────────────────────────────────────────┐");
-  Serial.println("│   VARUNA — Phase 3 Step 3: Sustained Rise       │");
+  Serial.println("│   VARUNA — Phase 3 Step 2: Rate of Change       │");
   Serial.println("└──────────────────────────────────────────────────┘");
 
   I2C_0.begin(SDA_0, SCL_0, 100000);
@@ -1229,11 +1412,9 @@ void setup() {
   sustainedBufIndex = 0;
   sustainedBufCount = 0;
   sustainedRise = false;
-  Serial.println("\n── SUSTAINED RISE BUFFER INIT ──");
-  Serial.printf("  Buffer size: %d readings\n", SUSTAINED_BUF_SIZE);
-  Serial.printf("  Rise threshold: %.1f cm between consecutive readings\n", SUSTAINED_RISE_THRESH);
-  Serial.printf("  Min rising pairs: %d of %d\n", SUSTAINED_RISE_MIN_PAIRS, SUSTAINED_BUF_SIZE - 1);
-  Serial.println("  ✓ SUSTAINED BUFFER READY");
+
+  verifyZoneClassification();
+  verifyRateOfChange();
 
   if (activeTransport != TRANSPORT_NONE) {
     postToFirebase();
@@ -1246,8 +1427,6 @@ void setup() {
   Serial.printf("  Zones: ALERT=%.0f  WARNING=%.0f  DANGER=%.0f cm\n",
                 alertLevelCm, warningLevelCm, dangerLevelCm);
   Serial.printf("  Rates: SLOW<2  MODERATE<5  FAST≥5 cm/15min\n");
-  Serial.printf("  Sustained: %d readings, %.1fcm thresh, %d min pairs\n",
-                SUSTAINED_BUF_SIZE, SUSTAINED_RISE_THRESH, SUSTAINED_RISE_MIN_PAIRS);
   Serial.println("══════════════════════════════════════════════════\n");
 }
 
@@ -1397,3 +1576,4 @@ void loop() {
 
   delay(8);
 }
+//---------------------------PHASE 3 Step 2-------------------------------
