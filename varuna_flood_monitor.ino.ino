@@ -1,3 +1,23 @@
+// Import the functions you need from the SDKs you need
+import { initializeApp } from "firebase/app";
+// TODO: Add SDKs for Firebase products that you want to use
+// https://firebase.google.com/docs/web/setup#available-libraries
+
+// Your web app's Firebase configuration
+const firebaseConfig = {
+  apiKey: "AIzaSyAIB22z-B_ep2o4aqMtKequluo5OaHxOZo",
+  authDomain: "varuna-dash.firebaseapp.com",
+  databaseURL: "https://varuna-dash-default-rtdb.asia-southeast1.firebasedatabase.app",
+  projectId: "varuna-dash",
+  storageBucket: "varuna-dash.firebasestorage.app",
+  messagingSenderId: "238413506463",
+  appId: "1:238413506463:web:1a0cb6d416d555dec9ffaa"
+};
+
+// Initialize Firebase
+const app = initializeApp(firebaseConfig);
+
+
 //---------------------------PHASE 3 Step 2-------------------------------
 #include <Wire.h>
 #include <HardwareSerial.h>
